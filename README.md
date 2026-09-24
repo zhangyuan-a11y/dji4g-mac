@@ -46,7 +46,7 @@ curl -fsSL https://github.com/zhangyuan-a11y/dji4g-mac/releases/latest/download/
 
 装完桌面会多出三个文件：一份完整说明书、一个一键诊断工具、一个卸载工具。
 
-> 客户电脑不方便上网？下载 [DJI4G-安装包.zip](https://github.com/zhangyuan-a11y/dji4g-mac/releases/latest/download/DJI4G-%E5%AE%89%E8%A3%85%E5%8C%85.zip)
+> 客户电脑不方便上网？下载 [DJI4G-安装包.zip](https://github.com/zhangyuan-a11y/dji4g-mac/releases/latest/download/DJI4G-installer.zip)
 > （约 3 MB），解压后双击里面的「双击安装.command」，或者把它拖进终端窗口回车 —— 全程离线，不需要联网。
 
 装好之后三步：
