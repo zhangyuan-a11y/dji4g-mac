@@ -30,6 +30,8 @@ DIAG_ASSET="diagnose.command"
 DIAG_LOCAL="DJI4G-诊断.command"
 README_ASSET="README.txt"
 README_LOCAL="DJI4G-使用说明.txt"
+UNINST_ASSET="uninstall.command"
+UNINST_LOCAL="DJI4G-卸载.command"
 
 BASE="${BASE_DEFAULT}"
 LOCAL_DIR=""
@@ -74,17 +76,20 @@ trap 'mv "${STAGE}" "${TMPDIR:-/tmp}/dji4g-leftover-$$" 2>/dev/null || true' EXI
 
 SRC=""
 if [ -n "${LOCAL_DIR}" ]; then
-  SRC="${LOCAL_DIR}"
-  [ -d "${SRC}/${APP_NAME}" ] || SRC="${LOCAL_DIR}/payload"
-  [ -d "${SRC}/${APP_NAME}" ] || die "在 ${LOCAL_DIR} 里找不到 ${APP_NAME}（也没有 payload/ 子目录）。"
+  # 依次找：程序/ 、payload/ 、安装包根目录
+  SRC=""
+  for CAND in "${LOCAL_DIR}/程序" "${LOCAL_DIR}/payload" "${LOCAL_DIR}" "${LOCAL_DIR}/App"; do
+    if [ -d "${CAND}/${APP_NAME}" ]; then SRC="${CAND}"; break; fi
+  done
+  [ -n "${SRC}" ] || die "在 ${LOCAL_DIR} 里找不到 ${APP_NAME}。请确认整个文件夹是完整解压出来的。"
   say "使用本地安装包"
 else
   ZIP_NAME="dji4g-${VERSION}-universal.zip"
   ZIP_URL="${BASE}/${ZIP_NAME}"
   say "下载安装包…"
-  curl -fL --progress-bar "${ZIP_URL}" -o "${STAGE}/${ZIP_NAME}" \
+  curl -fL --progress-bar --connect-timeout 15 --max-time 600 "${ZIP_URL}" -o "${STAGE}/${ZIP_NAME}" \
     || die "下载失败。请检查网络，或联系服务商确认下载地址。"
-  if curl -fsSL "${ZIP_URL}.sha256" -o "${STAGE}/${ZIP_NAME}.sha256" 2>/dev/null; then
+  if curl -fsSL --connect-timeout 15 --max-time 60 "${ZIP_URL}.sha256" -o "${STAGE}/${ZIP_NAME}.sha256" 2>/dev/null; then
     if ( cd "${STAGE}" && shasum -a 256 -c "${ZIP_NAME}.sha256" >/dev/null 2>&1 ); then
       say "完整性校验通过"
     else
@@ -121,8 +126,11 @@ if [ -d "${TARGET}" ]; then
 fi
 
 # ── 4. 安装 + 去隔离 + 签名兜底 ─────────────────────────────────
-ditto "${SRC}/${APP_NAME}" "${TARGET}" || die "复制到 ${DEST} 失败。"
-xattr -dr com.apple.quarantine "${TARGET}" 2>/dev/null || true
+# --noqtn：不要把下载时带的隔离标记复制过去
+# --noextattr / --norsrc：只搬真正的文件，别的杂项一律不带
+ditto --noqtn --norsrc --noextattr "${SRC}/${APP_NAME}" "${TARGET}" || die "复制到 ${DEST} 失败。"
+# 兜底再清一遍（旧版本留下的标记、以及从压缩包解压继承来的）
+xattr -cr "${TARGET}" 2>/dev/null || true
 
 CTL="${TARGET}/Contents/Resources/dji4gctl"
 
@@ -159,25 +167,41 @@ else
   say "命令行工具：${CTL}"
 fi
 
-# ── 7. 把诊断工具和说明书放到桌面 ───────────────────────────────
+# ── 7. 把说明书和工具放到桌面 ───────────────────────────────────
+#    本地有就用本地的（完全离线也能装），本地没有才去网上取。
 DESK="${HOME}/Desktop"
-if [ -d "${DESK}" ]; then
-  if [ -f "${SRC}/${DIAG_ASSET}" ]; then
-    cp "${SRC}/${DIAG_ASSET}" "${DESK}/${DIAG_LOCAL}" 2>/dev/null
-  elif [ -n "${LOCAL_DIR}" ] && [ -f "${LOCAL_DIR}/诊断.command" ]; then
-    cp "${LOCAL_DIR}/诊断.command" "${DESK}/${DIAG_LOCAL}" 2>/dev/null
-  else
-    curl -fsSL "${BASE}/${DIAG_ASSET}" -o "${DESK}/${DIAG_LOCAL}" 2>/dev/null || true
-  fi
-  chmod +x "${DESK}/${DIAG_LOCAL}" 2>/dev/null || true
 
-  if [ -f "${SRC}/${README_ASSET}" ]; then
-    cp "${SRC}/${README_ASSET}" "${DESK}/${README_LOCAL}" 2>/dev/null
-  elif [ -n "${LOCAL_DIR}" ] && [ -f "${LOCAL_DIR}/客户说明.txt" ]; then
-    cp "${LOCAL_DIR}/客户说明.txt" "${DESK}/${README_LOCAL}" 2>/dev/null
-  else
-    curl -fsSL "${BASE}/${README_ASSET}" -o "${DESK}/${README_LOCAL}" 2>/dev/null || true
+# place_file <桌面上的名字> <服务器上的名字> <本地候选路径…>
+place_file() {
+  local DEST_NAME="$1"
+  local ASSET_NAME="$2"
+  shift 2
+  local DEST="${DESK}/${DEST_NAME}"
+  local CAND=""
+  for CAND in "$@"; do
+    if [ -n "${CAND}" ] && [ -f "${CAND}" ]; then
+      if cp "${CAND}" "${DEST}" 2>/dev/null; then
+        break
+      fi
+    fi
+  done
+  if [ ! -f "${DEST}" ]; then
+    curl -fsSL --connect-timeout 5 --max-time 30 "${BASE}/${ASSET_NAME}" -o "${DEST}" 2>/dev/null || true
   fi
+  # 这三个文件是要给客户双击的，绝不能带着隔离标记落盘，
+  # 否则客户以后双击「诊断」「卸载」时又会被系统拦一次。
+  [ -f "${DEST}" ] && xattr -c "${DEST}" 2>/dev/null || true
+}
+
+if [ -d "${DESK}" ]; then
+  place_file "${DIAG_LOCAL}" "${DIAG_ASSET}" \
+    "${SRC}/${DIAG_ASSET}" "${LOCAL_DIR}/诊断.command" "${LOCAL_DIR}/一键诊断.command"
+  place_file "${UNINST_LOCAL}" "${UNINST_ASSET}" \
+    "${SRC}/卸载.command" "${LOCAL_DIR}/卸载.command" "${LOCAL_DIR}/一键卸载.command"
+  place_file "${README_LOCAL}" "${README_ASSET}" \
+    "${SRC}/${README_ASSET}" "${LOCAL_DIR}/使用说明.txt" "${LOCAL_DIR}/客户说明.txt"
+  chmod +x "${DESK}/${DIAG_LOCAL}" "${DESK}/${UNINST_LOCAL}" 2>/dev/null || true
+  chmod -x "${DESK}/${README_LOCAL}" 2>/dev/null || true
 fi
 
 # ── 8. 启动 ─────────────────────────────────────────────────────
@@ -201,8 +225,9 @@ cat <<TIP
      （一代模块出厂时这项是关的，开一次就永久生效，模块会重启约 20 秒）
   3. 点「体检」，它会逐项告诉你还差什么，缺什么直接给命令
 
-桌面上已经放好了两个文件：
+桌面上已经放好了三个文件：
   · ${README_LOCAL} —— 完整说明书，先看这个
   · ${DIAG_LOCAL} —— 出问题时双击它，把生成的报告发我
+  · ${UNINST_LOCAL} —— 想卸载时双击它，能顺便恢复原厂设置
 TIP
 echo "──────────────────────────────────────────────"
