@@ -17,6 +17,7 @@
 #    --local <目录>   从本地目录安装，不联网
 #    --base  <地址>   覆盖下载地址（等价于环境变量 DJI4G_BASE）
 #    --no-launch      装完不自动打开
+#    --no-autostart   不设置开机自启
 #    -h, --help       看帮助
 # ============================================================================
 set -euo pipefail
@@ -36,12 +37,14 @@ UNINST_LOCAL="DJI4G-卸载.command"
 BASE="${BASE_DEFAULT}"
 LOCAL_DIR=""
 LAUNCH=1
+AUTOSTART=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --local)     LOCAL_DIR="${2:-}"; shift 2 ;;
     --base)      BASE="${2:-}"; shift 2 ;;
     --no-launch) LAUNCH=0; shift ;;
+    --no-autostart) AUTOSTART=0; shift ;;
     -h|--help)
       cat <<'USAGE'
 DJI 4G 模块 · macOS 安装脚本
@@ -50,6 +53,7 @@ DJI 4G 模块 · macOS 安装脚本
   bash install.sh --local <目录>       从本地目录安装（目录里要有 payload/DJI4G.app）
   bash install.sh --base <地址>        指定下载地址
   bash install.sh --no-launch          装完不自动启动
+  bash install.sh --no-autostart       不设置开机自启
 
 环境变量 DJI4G_BASE 可以代替 --base。
 USAGE
@@ -147,14 +151,25 @@ say "已安装到 ${TARGET}"
 #    这一步就是当场把那种情况暴露出来。
 say "验证本机可运行…"
 SMOKE=0
-if "${CTL}" selftest >/dev/null 2>&1; then
+# 自检的输出留下来：一是判断成败，二是把真实的用例数抓出来。
+# 这里以前写死过「118 项」，后来用例涨到 190 多条，脚本就开始报假数。
+SELFTEST_LOG="${STAGE}/selftest.log"
+selftest_count() {
+  sed -n 's/^SELFTEST ok=\([0-9][0-9]*\) fail=.*/\1/p' "${SELFTEST_LOG}" 2>/dev/null | tail -1
+}
+if "${CTL}" selftest >"${SELFTEST_LOG}" 2>&1; then
   SMOKE=1
-  say "自检通过（118 项全部正常）"
+  COUNT="$(selftest_count)"
+  if [ -n "${COUNT}" ]; then
+    say "自检通过（${COUNT} 项全部正常）"
+  else
+    say "自检通过"
+  fi
 else
   warn "自检没通过，尝试重新签名…"
   codesign --force --sign - "${CTL}" >/dev/null 2>&1 || true
   codesign --force --sign - "${TARGET}" >/dev/null 2>&1 || true
-  if "${CTL}" selftest >/dev/null 2>&1; then
+  if "${CTL}" selftest >"${SELFTEST_LOG}" 2>&1; then
     SMOKE=1
     say "重新签名后自检通过"
   fi
@@ -170,6 +185,13 @@ fi
 # ── 7. 把说明书和工具放到桌面 ───────────────────────────────────
 #    本地有就用本地的（完全离线也能装），本地没有才去网上取。
 DESK="${HOME}/Desktop"
+# 客户机上 ~/Desktop 一般都在，但改过 iCloud 桌面、或者账号从没登录过图形
+# 就可能没有。没有就自己建一个 —— 不建的话下面整块会被跳过，而收尾照样念
+# 「桌面上已经放好了三个文件」，客户对着空桌面找不到诊断工具。
+[ -d "${DESK}" ] || mkdir -p "${DESK}" 2>/dev/null || true
+DESK_READY=0
+[ -d "${DESK}" ] && DESK_READY=1
+DESK_PLACED=0
 
 # place_file <桌面上的名字> <服务器上的名字> <本地候选路径…>
 place_file() {
@@ -190,10 +212,13 @@ place_file() {
   fi
   # 这三个文件是要给客户双击的，绝不能带着隔离标记落盘，
   # 否则客户以后双击「诊断」「卸载」时又会被系统拦一次。
-  [ -f "${DEST}" ] && xattr -c "${DEST}" 2>/dev/null || true
+  if [ -f "${DEST}" ]; then
+    xattr -c "${DEST}" 2>/dev/null || true
+    DESK_PLACED=$((DESK_PLACED + 1))
+  fi
 }
 
-if [ -d "${DESK}" ]; then
+if [ "${DESK_READY}" = "1" ]; then
   place_file "${DIAG_LOCAL}" "${DIAG_ASSET}" \
     "${SRC}/${DIAG_ASSET}" "${LOCAL_DIR}/诊断.command" "${LOCAL_DIR}/一键诊断.command"
   place_file "${UNINST_LOCAL}" "${UNINST_ASSET}" \
@@ -204,30 +229,94 @@ if [ -d "${DESK}" ]; then
   chmod -x "${DESK}/${README_LOCAL}" 2>/dev/null || true
 fi
 
-# ── 8. 启动 ─────────────────────────────────────────────────────
+# ── 8. 开机自启 ─────────────────────────────────────────────────
+#    注册一个 LaunchAgent，客户重启电脑后菜单栏图标会自己回来。
+#    少了这一步，重启后既接不到电话也收不到短信，而界面上看不出异常 ——
+#    客户只会以为「这东西坏了」。自检没过就不注册，免得开机拉起一个跑不起来的程序。
+# 结果记在 AUTOSTART_STATE 里，最后由它来写收尾那句话。以前收尾只看
+# --no-autostart 和自检两个条件，于是「注册失败」这条路上的收尾会照念
+# 「已经设好」—— 客户重启后图标没回来，还会以为是自己删错了东西。
+AUTOSTART_STATE="skipped"
+if [ "${AUTOSTART}" = "1" ]; then
+  if [ "${SMOKE}" != "1" ]; then
+    warn "自检没通过，跳过开机自启。修好之后在这里补：\"${CTL}\" autostart on \"${TARGET}\""
+    AUTOSTART_STATE="failed"
+  elif "${CTL}" autostart on "${TARGET}" >/dev/null 2>&1; then
+    say "已设置开机自启（重启电脑后会自动运行）"
+    AUTOSTART_STATE="ok"
+  else
+    warn "开机自启没设上，重启后需要自己打开一次 App。"
+    warn "想补上：\"${CTL}\" autostart on \"${TARGET}\""
+    AUTOSTART_STATE="failed"
+  fi
+fi
+
+# ── 9. 启动 ─────────────────────────────────────────────────────
 if [ "${LAUNCH}" = "1" ]; then
   open "${TARGET}" 2>/dev/null || true
   say "已启动，看屏幕右上角菜单栏的图标。"
 fi
 
-# ── 9. 收尾提示 ─────────────────────────────────────────────────
+# ── 10. 收尾提示 ────────────────────────────────────────────────
 echo
 echo "──────────────────────────────────────────────"
 if [ "${SMOKE}" != "1" ]; then
-  warn "本机自检没通过。请双击桌面上的「${DIAG_LOCAL}」，把生成的报告发给服务商。"
+  if [ "${DESK_READY}" = "1" ] && [ "${DESK_PLACED}" -ge 1 ]; then
+    warn "本机自检没通过。请双击桌面上的「${DIAG_LOCAL}」，把生成的报告发给服务商。"
+  else
+    warn "本机自检没通过。请双击安装包解压出来的文件夹里的「诊断.command」，把生成的报告发给服务商。"
+  fi
   echo
 fi
-cat <<TIP
-接下来三步：
 
-  1. 把大疆 4G 模块插到 Mac 的 USB 口（尽量直插，别经过扩展坞）
-  2. 点菜单栏图标 → 模块设置 → 开启通话音频
-     （一代模块出厂时这项是关的，开一次就永久生效，模块会重启约 20 秒）
-  3. 点「体检」，它会逐项告诉你还差什么，缺什么直接给命令
+# 这段话不能无条件说「已经设好」—— 上面有可能跳过了、也可能失败了。
+case "${AUTOSTART_STATE}" in
+  ok)
+    AUTOSTART_LINE="开机自启已经设好：重启电脑后菜单栏图标会自己回来，不用手动打开。" ;;
+  skipped)
+    AUTOSTART_LINE="这次没有设置开机自启：重启电脑后要自己打开一次 App。" ;;
+  *)
+    AUTOSTART_LINE="开机自启没设上：重启电脑后要自己打开一次 App。补上它，把这行粘进终端跑一次：${CTL} autostart on '${TARGET}'" ;;
+esac
 
-桌面上已经放好了三个文件：
+# 收尾这段话必须照实说：桌面没放成就别念「已经放好了」。
+# （第 7 节的 place_file 已经逐个试过，这里只负责如实汇总。）
+if [ "${DESK_READY}" != "1" ]; then
+  DESK_LINE="这台电脑上没能把说明书和工具放到桌面（~/Desktop 建不出来，多半被权限挡了）。
+安装包解压出来的那个文件夹里就有这几个文件：
+  · 使用说明.txt —— 完整说明书
+  · 诊断.command —— 出问题时双击它
+  · 卸载.command —— 想卸载时双击它"
+elif [ "${DESK_PLACED}" = "3" ]; then
+  DESK_LINE="桌面上已经放好了三个文件：
   · ${README_LOCAL} —— 完整说明书，先看这个
   · ${DIAG_LOCAL} —— 出问题时双击它，把生成的报告发我
-  · ${UNINST_LOCAL} —— 想卸载时双击它，能顺便恢复原厂设置
+  · ${UNINST_LOCAL} —— 想卸载时双击它，能顺便恢复原厂设置"
+else
+  DESK_LINE="桌面上只放好了 ${DESK_PLACED} 个文件（一共 3 个，缺的几个没取到 —— 大概网连不上）。
+已经在桌面的直接用；缺的那几个，在安装包解压出来的文件夹里也能找到。"
+fi
+
+# 第 4 步也得跟着实际情况说：桌面没放上就别让客户去桌面找。
+if [ "${DESK_READY}" = "1" ] && [ "${DESK_PLACED}" -ge 1 ]; then
+  DIAG_HINT="双击桌面上的「${DIAG_LOCAL}」"
+else
+  DIAG_HINT="双击安装包解压出来的文件夹里的「诊断.command」"
+fi
+
+cat <<TIP
+接下来四步：
+
+  1. 插上 SIM 卡（标准 nano-SIM，跟手机卡一样大）
+  2. 把大疆 4G 模块插到 Mac 的 USB 口（尽量直插，别经过扩展坞）
+  3. 点菜单栏图标 → 底部第二个按钮「模块设置」→「一键启用并重启模块」
+     （一代模块出厂时 USB 音频是关的，开一次就永久生效，模块会重启约 10 秒）
+  4. 还连不上：菜单栏面板的「模块」页会写着卡在哪一步，
+     也可以${DIAG_HINT}，把生成的报告发给服务商
+
+${AUTOSTART_LINE}
+不想要开机自启了，就在「系统设置 → 通用 → 登录项」里关掉它。
+
+${DESK_LINE}
 TIP
 echo "──────────────────────────────────────────────"
