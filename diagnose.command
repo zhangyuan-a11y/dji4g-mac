@@ -131,7 +131,7 @@ if [ -n "${CTL}" ]; then
   head_ "7. 网络诊断 network"
   cmd_ "${CTL}" network
 
-  head_ "8. 通话音频通道 voice"
+  head_ "8. 模块声卡通道 voice"
   cmd_ "${CTL}" voice
 
   head_ "9. macOS 网络服务 net-status"
@@ -153,6 +153,38 @@ say "收集系统日志（可能要十几秒）…"
 
 if [ ! -s "${APPLOG}" ]; then
   echo "(没有日志，或系统不给读)" > "${APPLOG}"
+fi
+
+# ── 10. 界面截图（客户看到的界面，出问题时最直观）────────────────
+#  只读：把面板的五个画面画成 PNG，连同真机摘要一起放进报告。
+#  App 正在运行时不跑这一步 —— 两个进程同时读 AT 口会互相抢，
+#  客户正看着的面板会闪一下。要看截图就先退出 App 再跑一次。
+head_ "10. 界面截图"
+SHOTS="${DIR}/界面截图"
+BIN="${APP}/Contents/MacOS/DJI4GMenuBar"
+mkdir -p "${SHOTS}"
+if [ ! -x "${BIN}" ]; then
+  echo "跳过：没找到 App 本体（${BIN}）" >> "${TXT}"
+elif pgrep -f "DJI4G.app/Contents/MacOS/DJI4GMenuBar" >/dev/null 2>&1; then
+  echo "跳过：菜单栏 App 正在运行，不能同时读模块。" >> "${TXT}"
+  echo "想要界面截图：先退出菜单栏 App（点菜单栏图标 → 退出），再跑一次诊断。" >> "${TXT}"
+else
+  printf '\n$ %s --render %s --hardware\n' "${BIN}" "${SHOTS}" >> "${TXT}"
+  # 二进制被系统杀掉时（比如这次会话没有图形界面），bash 会自己往终端印一行
+  # 「Abort trap: 6」。客户看到那行，只会以为诊断把电脑搞坏了。办法是让它在一
+  # 个子 shell 里收尾：子 shell 里还有第二条命令，bash 就不会把第一条 exec 掉，
+  # 那行提示也就跟着子 shell 的 stderr 一起被丢掉。退出码照样拿得到，真正的
+  # 失败原因仍然原样写进报告。
+  RENDER_RC=1
+  ( "${BIN}" --render "${SHOTS}" --hardware >> "${TXT}" 2>&1; echo $? > "${WORK}/render.rc" ) 2>/dev/null
+  [ -f "${WORK}/render.rc" ] && RENDER_RC="$(cat "${WORK}/render.rc")"
+  if [ "${RENDER_RC}" = "0" ]; then
+    ls -1 "${SHOTS}" >> "${TXT}" 2>/dev/null
+    say "界面截图 ✓"
+  else
+    printf '（这一步失败不影响上面几节；退出码 %s）\n' "${RENDER_RC}" >> "${TXT}"
+    warn "界面截图没跑成功（报告其余部分不受影响）"
+  fi
 fi
 
 # ── 打包 ────────────────────────────────────────────────────────
