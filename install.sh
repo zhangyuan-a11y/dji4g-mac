@@ -33,6 +33,13 @@ README_ASSET="README.txt"
 README_LOCAL="DJI4G-使用说明.txt"
 UNINST_ASSET="uninstall.command"
 UNINST_LOCAL="DJI4G-卸载.command"
+# 三个桌面文件打成一个 tar.gz 一起发。
+#
+# 为什么不逐个 curl：Finder 图标存在资源分支里，而 HTTP 传的是纯字节 ——
+# 单个文件 curl 下来的那份没有资源分支，落到桌面就是三个白板文件。macOS 的
+# tar 默认走 copyfile(3)，资源分支和扩展属性都跟着进包，解出来图标还在。
+# 这个资产是可选的：取不到就退回单个文件下载，装还是照装，只是图标没了。
+TOOLS_ASSET="desktop-tools.tar.gz"
 
 BASE="${BASE_DEFAULT}"
 LOCAL_DIR=""
@@ -193,27 +200,93 @@ DESK_READY=0
 [ -d "${DESK}" ] && DESK_READY=1
 DESK_PLACED=0
 
+# 三个桌面文件共用同一份「带图标的 tar.gz」：下载一次，三次取用。
+# 以前每个文件各下一次（1.2 MB），而且每次都白下 —— 见下面 place_file 的说明。
+TOOLS_BUNDLE=""
+TOOLS_BUNDLE_TRIED=0
+fetch_tools_bundle() {
+  if [ "${TOOLS_BUNDLE_TRIED}" = "1" ]; then return 0; fi
+  TOOLS_BUNDLE_TRIED=1
+  local DIR=""
+  DIR="$(mktemp -d 2>/dev/null || true)"
+  [ -n "${DIR}" ] || return 0
+  if curl -fsSL --connect-timeout 5 --max-time 60 \
+       "${BASE}/${TOOLS_ASSET}" -o "${DIR}/t.tgz" 2>/dev/null \
+     && tar -xzf "${DIR}/t.tgz" -C "${DIR}" 2>/dev/null; then
+    TOOLS_BUNDLE="${DIR}"
+  else
+    rm -rf "${DIR}" 2>/dev/null || true
+  fi
+}
+
 # place_file <桌面上的名字> <服务器上的名字> <本地候选路径…>
+#
+# 2026-09-26 改：以前整段在线取件都套在 `if [ ! -f "${DEST}" ]` 里 —— 桌面
+# 上已经有同名文件就直接跳过。看着像「省一次下载」，实际是「装第二遍的客户
+# 永远拿不到新的诊断脚本」：卖家这边把 diagnose.command 修好了、包也重发了，
+# 客户重跑一次安装，桌面上那份还是上一轮的，于是又拿着旧脚本跑出一份对不上
+# 的诊断报告。这类「两份副本悄悄不同步」的坑这个项目已经踩过好几次（桌面
+# 旧解压文件夹、交付工具目录里的旧 zip），每次都是靠人眼在 Finder 里翻出来
+# 的。所以现在改成：本地候选存在就覆盖；本地没有就每次都去网上取一份新的。
+#
+# 取的时候先落到临时目录，成功了才 ditto 到桌面。旧写法是 curl -o "${DEST}"
+# 直接写目标 —— 网断的时候 curl 会留下一个 0 字节的残file，于是「刷新失败」
+# 变成「把客户手上唯一一份好文件弄没了」。
 place_file() {
   local DEST_NAME="$1"
   local ASSET_NAME="$2"
   shift 2
   local DEST="${DESK}/${DEST_NAME}"
   local CAND=""
+  local PLACED=0
   for CAND in "$@"; do
     if [ -n "${CAND}" ] && [ -f "${CAND}" ]; then
-      if cp "${CAND}" "${DEST}" 2>/dev/null; then
+      # 这里必须是 ditto，不能是 cp。
+      #
+      # 「双击安装.command」「诊断」「卸载」三个文件的 Finder 图标存在资源
+      # 分支里（com.apple.ResourceFork）—— 安装包里的原件是带图标的，而
+      # cp(1) 只搬数据分支，搬完图标就没了。客户装完看到桌面上三个白板文件，
+      # 不知道哪个是哪个。（2026-09-26 在真机上核对过：安装包里带图标，
+      # 落到桌面就没有了。）ditto 连扩展属性一起搬，图标跟着过来。
+      if ditto "${CAND}" "${DEST}" 2>/dev/null; then
+        PLACED=1
         break
       fi
     fi
   done
-  if [ ! -f "${DEST}" ]; then
-    curl -fsSL --connect-timeout 5 --max-time 30 "${BASE}/${ASSET_NAME}" -o "${DEST}" 2>/dev/null || true
+  if [ "${PLACED}" = "0" ]; then
+    # 2a. 带图标的那一份（见 TOOLS_ASSET 的说明）。成员名就是服务器上的
+    #     ASCII 名字。整包一次解开，三个文件各取各的。
+    fetch_tools_bundle
+    if [ -n "${TOOLS_BUNDLE}" ] && [ -s "${TOOLS_BUNDLE}/${ASSET_NAME}" ]; then
+      ditto "${TOOLS_BUNDLE}/${ASSET_NAME}" "${DEST}" 2>/dev/null && PLACED=1
+    fi
+  fi
+  if [ "${PLACED}" = "0" ]; then
+    # 2b. 上面那条没成，退回单文件直下。这条路没有图标，但至少装得上 ——
+    #     装不上和图标难看，前者严重得多。
+    local DIR=""
+    DIR="$(mktemp -d 2>/dev/null || true)"
+    if [ -n "${DIR}" ]; then
+      if curl -fsSL --connect-timeout 5 --max-time 30 \
+           "${BASE}/${ASSET_NAME}" -o "${DIR}/${ASSET_NAME}" 2>/dev/null \
+         && [ -s "${DIR}/${ASSET_NAME}" ] \
+         && ditto "${DIR}/${ASSET_NAME}" "${DEST}" 2>/dev/null; then
+        PLACED=1
+      fi
+      rm -rf "${DIR}" 2>/dev/null || true
+    fi
   fi
   # 这三个文件是要给客户双击的，绝不能带着隔离标记落盘，
   # 否则客户以后双击「诊断」「卸载」时又会被系统拦一次。
   if [ -f "${DEST}" ]; then
-    xattr -c "${DEST}" 2>/dev/null || true
+    # 只摘隔离标记，不要 xattr -c。
+    #
+    # 原来的 `xattr -c` 是把所有扩展属性一次清光 —— 那样连上面刚从 ditto
+    # 搬过来的图标（资源分支）也一起擦掉，等于白搬。这里的目的只是「别带
+    # 隔离标记」，那就只删那一个键；键不存在时 xattr -d 会返回非零，所以要
+    # 用 || true 兜住，别让它把 set -e 触发了。
+    xattr -d com.apple.quarantine "${DEST}" 2>/dev/null || true
     DESK_PLACED=$((DESK_PLACED + 1))
   fi
 }
@@ -227,6 +300,9 @@ if [ "${DESK_READY}" = "1" ]; then
     "${SRC}/${README_ASSET}" "${LOCAL_DIR}/使用说明.txt" "${LOCAL_DIR}/客户说明.txt"
   chmod +x "${DESK}/${DIAG_LOCAL}" "${DESK}/${UNINST_LOCAL}" 2>/dev/null || true
   chmod -x "${DESK}/${README_LOCAL}" 2>/dev/null || true
+  # 共用包用完了。放在三个 place_file 之后才删，是因为它要同时供三家取；
+  # 删失败也无所谓，目录在 $TMPDIR 里，系统自己会回收。
+  [ -n "${TOOLS_BUNDLE}" ] && rm -rf "${TOOLS_BUNDLE}" 2>/dev/null || true
 fi
 
 # ── 8. 开机自启 ─────────────────────────────────────────────────
@@ -252,7 +328,40 @@ if [ "${AUTOSTART}" = "1" ]; then
 fi
 
 # ── 9. 启动 ─────────────────────────────────────────────────────
-if [ "${LAUNCH}" = "1" ]; then
+#    能托管就托管。`open` 起的这一份倒了就没了：菜单栏空着，来电和短信全丢，
+#    屏幕上却什么提示都没有；交给 launchd 的那一份由 plist 里的 KeepAlive 兜着，
+#    倒了会自己回来（客户自己点「退出」不算，那是 SuccessfulExit 管的事）。
+#    以前只写 plist 不加载，这条要等到客户下次重启电脑才生效，中间一直是裸奔。
+#
+#    顺序是刻意的：先 bootout 撤掉可能存在的旧注册，再清掉正在跑的实例，最后
+#    bootstrap。launchd 起一份、open 再起一份＝两个图标抢串口，那正是当初
+#    「不 bootstrap」要躲的坑 —— 所以下面这两条路只能走一条。
+LAUNCH_STATE="opened"
+if [ "${LAUNCH}" = "1" ] && [ "${AUTOSTART_STATE}" = "ok" ]; then
+  PLIST="${HOME}/Library/LaunchAgents/local.dji4g.menubar.plist"
+  if [ -f "${PLIST}" ]; then
+    launchctl bootout "gui/${UID}/local.dji4g.menubar" >/dev/null 2>&1 || true
+    pkill -f "DJI4G.app/Contents/MacOS/DJI4GMenuBar" >/dev/null 2>&1 || true
+    sleep 1
+    if launchctl bootstrap "gui/${UID}" "${PLIST}" >/dev/null 2>&1; then
+      # bootstrap 成功只代表注册上了，进程起没起要另问一句：注册成功但程序
+      # 起不来（被杀软拦、二进制坏了）时，客户那边是「装完什么都没有」。
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        sleep 0.5
+        LIVE_PID="$(launchctl print "gui/${UID}/local.dji4g.menubar" 2>/dev/null \
+                    | awk '/^[[:space:]]*pid = /{print $3; exit}')"
+        if [ -n "${LIVE_PID}" ]; then
+          LAUNCH_STATE="launchd"
+          break
+        fi
+      done
+    fi
+  fi
+fi
+
+if [ "${LAUNCH_STATE}" = "launchd" ]; then
+  say "已启动，看屏幕右上角菜单栏的图标。这一份由系统托管：万一它自己倒了会自动回来。"
+elif [ "${LAUNCH}" = "1" ]; then
   open "${TARGET}" 2>/dev/null || true
   say "已启动，看屏幕右上角菜单栏的图标。"
 fi
@@ -310,7 +419,8 @@ cat <<TIP
   1. 插上 SIM 卡（标准 nano-SIM，跟手机卡一样大）
   2. 把大疆 4G 模块插到 Mac 的 USB 口（尽量直插，别经过扩展坞）
   3. 点菜单栏图标 → 底部第二个按钮「模块设置」→「一键启用并重启模块」
-     （一代模块出厂时 USB 音频是关的，开一次就永久生效，模块会重启约 10 秒）
+     （一代模块出厂时网卡挂在 Windows 私有协议上、声卡位是关的；这一步把
+       它改成 macOS 认的 ECM 并写开声卡位，永久生效，模块重启约 10 秒）
   4. 还连不上：菜单栏面板的「模块」页会写着卡在哪一步，
      也可以${DIAG_HINT}，把生成的报告发给服务商
 
