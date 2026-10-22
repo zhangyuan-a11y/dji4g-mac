@@ -312,6 +312,11 @@ public final class ModuleVoiceSetup {
         guard adb.binary != nil else { throw SetupError.adbMissing }
         let report: (String) -> Void = { progress?(.step($0)) }
 
+        // 0) 型号门禁：下面推的 .ko 是一代 QDC507 专属组件，
+        //    在动手改任何设置之前先确认接进来的就是它。
+        guard let session else { throw SetupError.atRequired }
+        try ModuleIdentityGate.requireGenerationOne(session)
+
         // 1) 解锁 ADB —— 没解锁后面一步都做不了。
         if !adbAppears(within: 0) {
             report("第 1 步 · 准备模块")
@@ -323,6 +328,13 @@ public final class ModuleVoiceSetup {
         var status = inspect()
         if !status.driversLoaded {
             report("第 2 步 · 装入通话语音")
+            // 内核门禁：qdc507_*.ko 只在 3.18.44 线上验证过，
+            // 其他内核（包括二代）一律拒绝，绝不能靠“试试看”。
+            let kernel = ((try? adb.shell("uname -r", timeout: 15)) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard ModuleGate.voiceKernelSupported(kernel) else {
+                throw ModuleGateError.unsupportedKernel(kernel: kernel)
+            }
             try pushResources()
             try loadDrivers()
         }
@@ -391,6 +403,17 @@ public final class ModuleVoiceSetup {
     @discardableResult
     public func removeStagedFiles() -> RestoreReport {
         var report = RestoreReport()
+        // 复原会 rm / rmmod / 杀进程，全是写操作：确认不了型号就不动模块。
+        if let session {
+            do { try ModuleIdentityGate.requireGenerationOne(session) }
+            catch {
+                report.skippedReason = "未确认是一代模块，已跳过模块内清理"
+                return report
+            }
+        } else {
+            report.skippedReason = "没有 AT 会话，无法确认型号，已跳过模块内清理"
+            return report
+        }
         guard adb.binary != nil else {
             report.skippedReason = "这台机器上没有 adb"
             return report

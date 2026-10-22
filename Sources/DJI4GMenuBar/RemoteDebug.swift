@@ -162,6 +162,10 @@ final class ReadOnlyPage: @unchecked Sendable {
     static let lifetime: TimeInterval = 600
     /// 页面上放多少行日志。
     static let logLines = 60
+    /// 同时最多接待几个连接：页面是给人看的，不是给扫描器灌的。
+    static let maxConnections = 8
+    /// 一个连接最多挂这么久（收请求 + 回话），超时直接断开。
+    static let idleTimeout: TimeInterval = 10
 
     static let shared = ReadOnlyPage()
 
@@ -205,6 +209,7 @@ final class ReadOnlyPage: @unchecked Sendable {
     private var stopTimer: DispatchSourceTimer?
     private var portValue: UInt16?
     private var deadlineValue: Date?
+    private var activeConnections = 0
     private var status = "正在读取…"
     private var log = "正在读取…"
 
@@ -425,31 +430,81 @@ final class ReadOnlyPage: @unchecked Sendable {
 
     // MARK: 收发
 
+    /// 每个连接一个“只释放一次”的名额，避免回话完成和看门狗取消各放一次。
+    private final class ConnectionSlot {
+        private let lock = NSLock()
+        private var finished = false
+
+        func finish(_ body: () -> Void) {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !finished else { return }
+            finished = true
+            body()
+        }
+    }
+
     private func handle(_ connection: NWConnection) {
-        connection.stateUpdateHandler = { [weak connection] state in
-            guard let connection, case .ready = state else { return }
-            connection.stateUpdateHandler = nil
-            self.collect(connection, collected: Data())
+        // 并发上限：超过就立刻断开，不让占着连接不干活。
+        lock.lock()
+        if activeConnections >= Self.maxConnections {
+            lock.unlock()
+            connection.cancel()
+            return
+        }
+        activeConnections += 1
+        lock.unlock()
+
+        let slot = ConnectionSlot()
+        let watchdog = DispatchWorkItem { connection.cancel() }
+        queue.asyncAfter(deadline: .now() + Self.idleTimeout, execute: watchdog)
+
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let connection else { return }
+            switch state {
+            case .ready:
+                connection.stateUpdateHandler = nil
+                self?.collect(connection, collected: Data(), watchdog: watchdog, slot: slot)
+            case .failed, .cancelled:
+                connection.stateUpdateHandler = nil
+                watchdog.cancel()
+                slot.finish { self?.releaseConnection() }
+            default:
+                break
+            }
         }
         connection.start(queue: queue)
+    }
+
+    private func releaseConnection() {
+        lock.lock()
+        activeConnections = max(0, activeConnections - 1)
+        lock.unlock()
     }
 
     /// 收请求头。
     ///
     /// TCP 会把一个请求切成几段，所以这里攒到头部那个空行再开口 —— 按第一段
     /// 就回话，会随请求大小偶发地回出 400，而且只在某些浏览器上出现。
-    private func collect(_ connection: NWConnection, collected: Data) {
+    private func collect(_ connection: NWConnection,
+                          collected: Data,
+                          watchdog: DispatchWorkItem,
+                          slot: ConnectionSlot) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { data, _, complete, _ in
             var buffer = collected
             if let data { buffer.append(data) }
             let text = String(decoding: buffer, as: UTF8.self)
             guard text.contains("\r\n\r\n") || text.contains("\n\n")
                     || complete || buffer.count >= 16_384 else {
-                self.collect(connection, collected: buffer)
+                self.collect(connection, collected: buffer, watchdog: watchdog, slot: slot)
                 return
             }
             connection.send(content: self.response(for: text),
-                            completion: .contentProcessed { _ in connection.cancel() })
+                            completion: .contentProcessed { _ in
+                                watchdog.cancel()
+                                connection.cancel()
+                                slot.finish { self.releaseConnection() }
+                            })
         }
     }
 
@@ -466,17 +521,20 @@ final class ReadOnlyPage: @unchecked Sendable {
             return reply(400, "text/plain; charset=utf-8", "看不懂的请求。")
         }
 
+        let base = "/\(token)"
+        let path = parts[1]
+
+        // 先问「是谁」，再问「用什么动词」。反过来写的话，一个没带钥匙的
+        // POST 也能拿到 405 —— 等于告诉扫端口的人“这里有个服务”。这里让
+        // 没带钥匙的请求不管用什么动词、要哪一段，一律只看到 404。
+        guard path == base || path.hasPrefix(base + "/") else {
+            return reply(404, "text/plain; charset=utf-8", "404")
+        }
+
         let method = parts[0].uppercased()
         guard method == "GET" || method == "HEAD" else {
             return reply(405, "text/plain; charset=utf-8",
                          "本页只读：用浏览器打开就行。")
-        }
-
-        let base = "/\(token)"
-        let path = parts[1]
-        // 没带钥匙的请求连「这个端口上有人」都不告诉它：根路径和错码一样 404。
-        guard path == base || path.hasPrefix(base + "/") else {
-            return reply(404, "text/plain; charset=utf-8", "404")
         }
 
         lock.lock()
@@ -511,6 +569,9 @@ final class ReadOnlyPage: @unchecked Sendable {
         head += "Content-Type: \(type)\r\n"
         head += "Content-Length: \(payload.count)\r\n"
         head += "Cache-Control: no-store\r\n"
+        head += "X-Content-Type-Options: nosniff\r\n"
+        head += "Referrer-Policy: no-referrer\r\n"
+        head += "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n"
         head += "Connection: close\r\n\r\n"
         return headOnly ? Data(head.utf8) : Data(head.utf8) + payload
     }
@@ -705,7 +766,7 @@ struct RemoteDebugSection: View {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 8, weight: .bold))
                         .rotationEffect(.degrees(expanded ? 90 : 0))
-                    Text("远程调试").label(10).foregroundStyle(Theme.ink)
+                    Text("只读查看").label(10).foregroundStyle(Theme.ink)
                     // 开着才写「还剩多久」；没开就一个字都不写 ——
                     // 「关着」这种口语状态词不该占客户的地方。
                     if !caption.isEmpty {

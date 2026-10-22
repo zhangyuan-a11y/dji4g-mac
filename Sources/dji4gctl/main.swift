@@ -210,6 +210,18 @@ func runSelfTest() -> Bool {
     check("真机 ATI：固件号不当型号", djiIdentity.revision == "QDC507GLEFM21")
     check("真机 AT+QGMR：构建号", djiIdentity.firmwareBuild == "QDC507GLEFM21_01.001.02.004")
 
+    // --- 型号门禁：一代与二代严格分开，认不出的一律拒绝写入。
+    check("门禁：QDC507 是一代", ModuleGate.isGenerationOne(model: "QDC507"))
+    check("门禁：EG25 是一代", ModuleGate.isGenerationOne(model: nil, revision: "EG25-G"))
+    check("门禁：固件号带 QDC507 也认一代",
+          ModuleGate.isGenerationOne(model: nil, revision: nil, build: "QDC507GLEFM21_01.001.02.004"))
+    check("门禁：二代 IG832 拒绝", !ModuleGate.isGenerationOne(model: "IG832"))
+    check("门禁：未知型号拒绝", !ModuleGate.isGenerationOne(model: ""))
+    check("门禁：空白身份拒绝", !ModuleGate.isGenerationOne(model: nil, revision: nil, build: nil))
+    check("门禁：语音内核 3.18.44 放行", ModuleGate.voiceKernelSupported("3.18.44-perf"))
+    check("门禁：其他内核拒绝", !ModuleGate.voiceKernelSupported("5.15.0-android8"))
+    check("门禁：空内核拒绝", !ModuleGate.voiceKernelSupported("  "))
+
     // --- 白名单之外的贴牌模块也不能再显示「未识别」：兜底要挑那条短的型号行，
     // 不能挑走厂名，也不能挑走固件号。
     let oemATI = ATResponse(command: "ATI",
@@ -1308,6 +1320,12 @@ func runSimulatorSuite(_ check: (String, @autoclosure () -> Bool) -> Void) -> (p
     verify("出厂组态无模块声卡", controller.data.status.composition?.supportsVoice == false)
     verify("APN 可下发", (try? controller.data.configureAPN("CTNET")) != nil)
     verify("APN 可回读", (try? controller.data.readAPN()) ?? nil == "CTNET")
+    // APN 是嵌进带引号 AT 字符串的字段：引号/逗号/换行/空串都必须挡在门外。
+    verify("APN 拒绝引号", (try? controller.data.configureAPN("bad\"apn")) == nil)
+    verify("APN 拒绝逗号", (try? controller.data.configureAPN("bad,apn")) == nil)
+    verify("APN 拒绝换行", (try? controller.data.configureAPN("bad\napn")) == nil)
+    verify("APN 拒绝空串", (try? controller.data.configureAPN("  ")) == nil)
+    verify("APN 用户名拒绝引号", (try? controller.data.configureAPN("CTNET", username: "u\"x")) == nil)
 
     // 截图夹具钉住的字节数，轮询不许把它冲掉。这台机器上只要插着模块，
     // 真网卡的流量就会飘进截图：环形从「剩 43%」变成「剩 100%」，底部那行

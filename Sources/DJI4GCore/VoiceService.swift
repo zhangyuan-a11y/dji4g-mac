@@ -411,6 +411,8 @@ public final class VoiceService {
     /// 这里整串覆盖要是把它抹了，下次打电话就没声音，而且提示是「ADB 未解锁」，
     /// 很难联想到这里。
     public func setAudioFunction(_ on: Bool, reboot: Bool = true) throws -> USBComposition {
+        // usbcfg 是会写进模块存储的设置：写之前必须确认这是一代模块。
+        try ModuleIdentityGate.requireGenerationOne(session)
         var updated = try currentComposition()
         updated.audio = on
         return try writeComposition(updated, reboot: reboot)
@@ -426,6 +428,8 @@ public final class VoiceService {
     /// 复原之后模块就是「没改装过」的样子，插回大疆的设备直接能用；要再回到
     /// Mac 上用，跑一遍 `dji4gctl prepare` 即可。
     public func restoreFactoryFunction(reboot: Bool = true) throws -> USBComposition {
+        // 复原同样是一次写操作，走同一道门禁。
+        try ModuleIdentityGate.requireGenerationOne(session)
         var updated = try currentComposition()
         updated.adb = false
         updated.audio = false

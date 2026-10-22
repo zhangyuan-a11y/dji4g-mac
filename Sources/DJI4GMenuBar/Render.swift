@@ -253,7 +253,7 @@ enum RenderHarness {
                    "panel-ringing", width: Theme.panelWidth, to: directory)
             // 浮层卡片本来的样子。它是一块盖在全屏之上的窗口，截图里只有它
             // 自己，所以这张图是给交付说明用的：「来电时屏幕上会出现这个」。
-            render(RingCard(number: "+8618957549662", title: "来电响铃", answer: {}, reject: {}),
+            render(RingCard(number: "+8613800138000", title: "来电响铃", answer: {}, reject: {}),
                    "ring-card", width: 304, to: directory)
         }
 
@@ -1771,6 +1771,10 @@ enum RenderHarness {
                   ask("GET / HTTP/1.1\r\n\(host)\r\n") == 404)
             check("写的动词被挡下（405）",
                   ask("POST /\(page.token)/ HTTP/1.1\r\n\(host)Content-Length: 0\r\n\r\n") == 405)
+            check("没带钥匙的写请求也只看到 404（不暴露这里有服务）",
+                  ask("POST /nope/ HTTP/1.1\r\n\(host)Content-Length: 0\r\n\r\n") == 404)
+            check("乱请求行只拿到 400",
+                  ask("GARBAGE\r\n\(host)\r\n") == 400)
             page.stop()
             check("关掉之后就不在服务了", !page.isRunning)
         } else {

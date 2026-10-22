@@ -116,11 +116,13 @@ public struct DataStatus: Equatable {
 public enum DataError: Error, CustomStringConvertible {
     case rejected(ATFinal)
     case noInterface(String)
+    case invalidParameter(String)
 
     public var description: String {
         switch self {
         case .rejected(let final): return "模块拒绝操作：\(final.text)"
         case .noInterface(let detail): return detail
+        case .invalidParameter(let detail): return detail
         }
     }
 }
@@ -262,6 +264,8 @@ public final class DataService {
     /// value would otherwise be reported as a success it never adopted.
     @discardableResult
     public func setUSBnetMode(_ mode: USBnetMode, reboot: Bool = false) throws -> USBnetMode {
+        // 上网模式也是持久化写入：只允许写在一代模块上，别的型号一律只读。
+        try ModuleIdentityGate.requireGenerationOne(session)
         guard let template = profile.usbNetModeWrite else {
             throw DataError.noInterface("这块模块没有切换上网模式的命令，通常不用改。")
         }
@@ -287,6 +291,22 @@ public final class DataService {
                              password: String = "",
                              authentication: Int = 0,
                              context: Int = 1) throws {
+        // APN / 用户名 / 密码都要原样嵌进带引号的 AT 字符串里。放进去之前
+        // 先把会拆坏这条命令的字符挡在门外：引号会提前结束字段、逗号会多切
+        // 一个字段、换行/回车/空字符能直接改写成「另一条命令」。APN 本身
+        // 允许点、横线、下划线这些，所以只黑名单最危险的那几个。
+        for (name, value) in [("APN", apn), ("用户名", username), ("密码", password)] {
+            let bad = value.contains { ch in
+                ch == "\"" || ch == "," || ch == "\r" || ch == "\n" || ch == "\0"
+            }
+            if bad {
+                throw DataError.invalidParameter("\(name) 里不能有引号、逗号或换行：\(value)")
+            }
+        }
+        guard !apn.trimmingCharacters(in: .whitespaces).isEmpty else {
+            throw DataError.invalidParameter("APN 不能为空")
+        }
+
         let command = "AT+QICSGP=\(context),1,\"\(apn)\",\"\(username)\",\"\(password)\",\(authentication)"
         let response = try session.send(command, timeout: 8)
         guard response.final == .ok else { throw DataError.rejected(response.final) }

@@ -286,6 +286,24 @@ say "闸门 4/5 通过：通话语音资源与自带 adb 都在包里"
 say "打 App 单包…"
 ditto -c -k --keepParent --norsrc --noextattr --noacl --noqtn "${PAYLOAD_APP}" "${DEL}/${ZIP_APP}"
 
+# ── 3z. 把完整性钉子写进 install.sh ─────────────────────────────
+# 安装脚本在线下载时不再信「服务器上那份 .sha256」，而是同时核对钉在脚本
+# 自己身上的指纹。四个钉子都在这里出包时写入，时机必须早于下面打完整安装包
+# ——完整包里嵌的就是这份 install.sh。
+pin_of() { shasum -a 256 "$1" | cut -d' ' -f1; }
+PIN_APP="$(pin_of "${DEL}/${ZIP_APP}")"
+PIN_DIAG="$(pin_of "${DEL}/诊断.command")"
+PIN_UNINST="$(pin_of "${DEL}/卸载.command")"
+PIN_README="$(pin_of "${DEL}/客户说明.txt")"
+for kv in "PINNED_ZIP_SHA256=${PIN_APP}" "PINNED_DIAGNOSE_SHA256=${PIN_DIAG}" \
+          "PINNED_UNINSTALL_SHA256=${PIN_UNINST}" "PINNED_README_SHA256=${PIN_README}"; do
+  KEY="${kv%%=*}"
+  /usr/bin/sed -i '' -E "s|^${KEY}=.*$|${kv}|" "${DEL}/install.sh"
+done
+grep -q 'PLACEHOLDER' "${DEL}/install.sh" \
+  && die "install.sh 里还有没写进去的完整性钉子，禁止出包。"
+say "安装脚本完整性钉子已写入"
+
 say "打完整安装包…"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/dji4g-pack.XXXXXX")"
 PKG="${STAGE}/${FOLDER_INSTALLER}"
@@ -397,6 +415,35 @@ printf '%s\n' "${INS_HASH_ASSET}" > "${ASSETS}/${ZIP_INSTALLER_ASSET}.sha256"
 chmod +x "${ASSETS}/diagnose.command" "${ASSETS}/uninstall.command" \
          "${ASSETS}/install.sh" "${ASSETS}/双击安装.command"
 say "发布资产已刷新"
+
+
+# ── 6z. 生成不可变发布清单 manifest.json ─────────────────────────
+# 上传脚本只认这份清单：tag 每次出包唯一，正式 Release 一旦存在就不允许覆盖。
+RELEASE_TAG="v${VERSION}-$(date +%Y%m%d%H%M%S)"
+( cd "${ASSETS}" && /usr/bin/python3 - "${RELEASE_TAG}" "${VERSION}" <<'PYMANIFEST'
+import json, os, subprocess, sys
+tag, version = sys.argv[1], sys.argv[2]
+names = [
+    "DJI4G-installer.zip", "DJI4G-installer.zip.sha256",
+    "dji4g-1.0-universal.zip", "dji4g-1.0-universal.zip.sha256",
+    "install.sh", "README.txt", "diagnose.command",
+    "uninstall.command", "desktop-tools.tar.gz",
+]
+assets = []
+for name in names:
+    if not os.path.isfile(name):
+        raise SystemExit(f"manifest 缺文件：{name}")
+    digest = subprocess.check_output(["shasum", "-a", "256", name], text=True).split()[0]
+    assets.append({"name": name, "sha256": digest, "size": os.path.getsize(name)})
+manifest = {"tag": tag, "version": version,
+            "created": subprocess.check_output(["date", "+%Y-%m-%d %H:%M:%S %Z"], text=True).strip(),
+            "assets": assets}
+with open("manifest.json", "w", encoding="utf-8") as f:
+    json.dump(manifest, f, ensure_ascii=False, indent=2)
+    f.write("\n")
+PYMANIFEST
+) || die "manifest.json 生成失败"
+say "发布清单 manifest.json 已生成（${RELEASE_TAG}）"
 
 if [ -d "${DESK}" ]; then
   mkdir -p "${HAND}"
