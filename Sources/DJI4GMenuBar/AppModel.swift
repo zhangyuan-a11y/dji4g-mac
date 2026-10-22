@@ -217,6 +217,12 @@ final class AppModel: ObservableObject {
     static let apnOwnerSIMKey = "DJI4G.apnOwnerSIM"
     /// 「有人在这台机器上按过运营商按钮，卡还没插」。见 `rememberAPNOwner`。
     static let apnManualKey = "DJI4G.apnManualPick"
+    /// 「这张卡手填的 APN 是哪一个」。字典：SIMKey（ICCID/IMSI）→ APN。
+    ///
+    /// 和 `apnOwnerSIMKey` 分工：那个只记「这个 APN 是这张卡写的」，这里记的
+    /// 是**值本身**。模块被重置、或者换回这张卡时，能把客户手填的 APN 原样
+    /// 写回去，而不是退回运营商默认值。
+    static let customAPNKey = "DJI4G.customAPN"
     private static let dayKeyKey = "DJI4G.dayKey"
     /// 「今日 / 本月」现在是**累加**出来的，所以要落盘 —— 当天 / 当月的已用量
     /// 加一次就把结果写回去，重启以后接着加。旧的 `dayBaseKey` 只留给升级迁移
@@ -1490,6 +1496,7 @@ final class AppModel: ObservableObject {
         run("设置接入点") {
             try self.controller.data.configureAPN(trimmed)
             self.rememberAPNOwner(manual: true)
+            self.saveCustomAPN(trimmed, for: self.currentSIMKey)
             self.note("接入点 = \(trimmed)")
             _ = self.controller.refreshData()
         }
@@ -1516,6 +1523,25 @@ final class AppModel: ObservableObject {
         let iccid = controller.sim.iccid.trimmingCharacters(in: .whitespacesAndNewlines)
         if !iccid.isEmpty { return iccid }
         return controller.sim.imsi.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 这张卡有没有手填过的 APN。有就返回那个值（读不出卡号时返回 nil）。
+    private func savedCustomAPN(for key: String) -> String? {
+        guard !key.isEmpty else { return nil }
+        let dict = UserDefaults.standard.dictionary(forKey: AppModel.customAPNKey)
+            as? [String: String]
+        let value = dict?[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (value?.isEmpty ?? true) ? nil : value
+    }
+
+    /// 把手填 APN 记到这张卡名下（读不出卡号就不记，免得张冠李戴）。
+    private func saveCustomAPN(_ apn: String, for key: String) {
+        let trimmed = apn.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty, !trimmed.isEmpty else { return }
+        var dict = (UserDefaults.standard.dictionary(forKey: AppModel.customAPNKey)
+            as? [String: String]) ?? [:]
+        dict[key] = trimmed
+        UserDefaults.standard.set(dict, forKey: AppModel.customAPNKey)
     }
 
     /// 模块里那个 APN 是不是**别的卡**的 —— 是就该改写。
@@ -1552,7 +1578,7 @@ final class AppModel: ObservableObject {
         let home = controller.sim.homeCarrier
         let reference = home.apn.isEmpty ? controller.network.carrier : home
         guard !reference.apn.isEmpty else { return false }
-        return moduleAPN.caseInsensitiveCompare(reference.apn) != .orderedSame
+        return !reference.matches(apn: moduleAPN)
     }
 
     /// 把「模块里这个 APN 是给哪张卡写的」记下来。
@@ -1593,14 +1619,14 @@ final class AppModel: ObservableObject {
         }
         // 没换卡的时候，这一轮试过就不再试（失败留给按钮和体检报告去说）。
         guard swapped || !didAutoApplyAPN else { return }
-        let carrier = controller.network.carrier
+        let carrier = autoCarrier()
         guard !carrier.apn.isEmpty else { return }
         didAutoApplyAPN = true
         if swapped {
             note("换了张卡，接入点改成 \(carrier.apn)（\(carrier.name)）")
         }
         do {
-            _ = try controller.applyCarrierAPN(force: false)
+            _ = try controller.applyCarrierAPN(force: false, carrier: carrier)
             rememberAPNOwner()
             // 面板上「接入点 待写入」那一行要当场跟着变。不回读这一下，
             // 客户插上卡看到的第一眼仍是旧的空值，会以为没配上。
@@ -1608,6 +1634,17 @@ final class AppModel: ObservableObject {
         } catch {
             note("自动配置没成功：\(error)")
         }
+    }
+
+    /// 自动路要写的运营商：这张卡手填过 APN 就用那个值（模块被重置也能原样
+    /// 写回），否则用 IMSI 推出的归属运营商。
+    private func autoCarrier() -> Carrier {
+        if let custom = savedCustomAPN(for: currentSIMKey) {
+            let home = controller.sim.homeCarrier
+            return Carrier(mccmnc: home.mccmnc, name: "自定义接入点",
+                           shortName: home.shortName, apns: [custom], region: home.region)
+        }
+        return controller.sim.homeCarrier
     }
 
     /// 模块注册上来之后补写一次 APN。

@@ -695,7 +695,7 @@ struct SetupWindow: View {
     /// 「生效」—— 那时候读回来的 APN 还是上一次的缓存，点亮它是在骗人。
     private func apnActive(for carrier: Carrier) -> Bool {
         model.isConnected
-            && model.data.apn.caseInsensitiveCompare(carrier.apn) == .orderedSame
+            && carrier.matches(apn: model.data.apn)
     }
 
     /// 自动识别：一个按钮按下就用「卡归属运营商」配 APN；旁边一行字把当前

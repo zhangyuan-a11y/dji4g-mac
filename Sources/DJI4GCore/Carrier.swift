@@ -10,25 +10,39 @@ public enum CarrierRegion: String, Equatable {
     case unknown = "未知"
 }
 
-/// MCC/MNC → carrier identity plus the APN the module should use on it.
+/// MCC/MNC → 运营商身份 + 该运营商可用的候选 APN 列表。
+///
+/// APN 单独放进 `apns`（按优先级排列，首个是首选）：同一家运营商的套餐可能
+/// 用不同 APN，写首选失败时按顺序退到下一个候选。`apn` 是首选，给老代码用。
 public struct Carrier: Equatable, Hashable {
     public let mccmnc: String
     public let name: String
     public let shortName: String
-    public let apn: String
+    public let apns: [String]
     public let region: CarrierRegion
 
-    public init(mccmnc: String, name: String, shortName: String, apn: String,
+    public init(mccmnc: String, name: String, shortName: String, apns: [String],
                 region: CarrierRegion = .unknown) {
         self.mccmnc = mccmnc
         self.name = name
         self.shortName = shortName
-        self.apn = apn
+        self.apns = apns
         self.region = region
     }
 
+    /// 首选 APN。空串 = 认不出、不写。
+    public var apn: String { apns.first ?? "" }
+
+    /// 该 APN 是否命中任一候选（不区分大小写）。
+    public func matches(apn candidate: String) -> Bool {
+        guard !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        return apns.contains { $0.caseInsensitiveCompare(candidate) == .orderedSame }
+    }
+
     public static let unknown = Carrier(mccmnc: "", name: "未知运营商", shortName: "未知",
-                                        apn: "", region: .unknown)
+                                        apns: [], region: .unknown)
 }
 
 public enum CarrierCatalog {
@@ -37,44 +51,46 @@ public enum CarrierCatalog {
     /// default firmware.
     private static let table: [String: Carrier] = {
         var map: [String: Carrier] = [:]
-        func add(_ codes: [String], _ name: String, _ short: String, _ apn: String) {
+        func add(_ codes: [String], _ name: String, _ short: String, _ apns: [String]) {
             for code in codes {
                 let region = CarrierCatalog.region(forMCC: String(code.prefix(3)))
                 map[code] = Carrier(mccmnc: code, name: name, shortName: short,
-                                    apn: apn, region: region)
+                                    apns: apns, region: region)
             }
         }
-        add(["46000", "46002", "46004", "46007", "46008"], "中国移动", "移动", "CMNET")
-        add(["46003", "46005", "46011", "46012"], "中国电信", "电信", "CTNET")
-        add(["46001", "46006", "46009"], "中国联通", "联通", "3GNET")
-        add(["46015", "46020"], "中国广电", "广电", "CBNET")
+        add(["46000", "46002", "46004", "46007", "46008"], "中国移动", "移动", ["CMNET"])
+        add(["46003", "46005", "46011", "46012"], "中国电信", "电信", ["CTNET"])
+        add(["46001", "46006", "46009"], "中国联通", "联通", ["3GNET"])
+        add(["46015", "46020"], "中国广电", "广电", ["CBNET"])
 
         // ── 香港（MCC 454）。APN 用各家的官方默认；不同套餐可能不同，只在
         //    自动识别**能确定**归属运营商时才写，绝不覆盖客户手改的 APN。
         //    注意 CMHK 是「中国移动香港」，不是大陆中国移动 —— 以前错配成
         //    CMNET（大陆 APN），香港卡插进去会上不了网。
-        add(["45412", "45413"], "中国移动香港 CMHK", "CMHK", "cmhk")
-        add(["45403", "45404", "45405"], "3香港 3HK", "3HK", "mobile.lte.three.com.hk")
-        add(["45406", "45415", "45416"], "数码通 SmarTone", "SmarTone", "smartone")
+        add(["45412", "45413"], "中国移动香港 CMHK", "CMHK", ["cmhk"])
+        add(["45403", "45404", "45405"], "3香港 3HK", "3HK", ["mobile.lte.three.com.hk"])
+        add(["45406", "45415", "45416"], "数码通 SmarTone", "SmarTone",
+            ["smartone", "internet"])
         // CSL 与 1010 共用 MCC/MNC 454-00，按套餐可能不同；统一给 CSL 的官方
         // 默认 mobile，1010 作为可选按钮单独列出。
-        add(["45400", "45402", "45410", "45418", "45419"], "CSL 香港电讯", "CSL", "mobile")
-        add(["45500", "45501", "45502", "45503", "45504", "45505"], "CTM 澳门电讯", "CTM", "ctmnet")
-        add(["46601", "46692", "46693"], "Chunghwa 中华电信", "CHT", "internet")
-        add(["46697", "46699"], "Taiwan Mobile 台湾大哥大", "TWM", "internet")
-        add(["46688", "46689"], "FarEasTone 远传", "FET", "internet")
-        add(["310260", "310200", "310210", "310220", "310230", "310240", "310250", "310270", "310310", "310490"], "T-Mobile US", "T-Mobile", "fast.t-mobile.com")
-        add(["310410", "310150", "310170", "310380", "310560"], "AT&T", "AT&T", "nxtgenphone")
-        add(["311480", "310004", "310012", "310013"], "Verizon", "Verizon", "vzwinternet")
-        add(["26201", "26206", "26278"], "Telekom DE", "T-Mobile DE", "internet.telekom")
-        add(["26202", "26209", "26242"], "Vodafone DE", "Vodafone", "web.vodafone.de")
-        add(["26203", "26208", "26223", "26243"], "O2 DE", "O2", "internet")
-        add(["23410", "23430", "23433"], "EE UK", "EE", "everytime")
-        add(["23415", "23420", "23430"], "Vodafone UK", "Vodafone", "internet")
-        add(["23430", "23431"], "EE / Virgin UK", "EE", "everytime")
-        add(["44010", "44011", "44020"], "NTT docomo", "docomo", "spmode.ne.jp")
-        add(["44020", "44051", "44053"], "SoftBank JP", "SoftBank", "plus.4g")
-        add(["45005", "45008", "45000", "45002"], "SKT / KT KR", "KR", "internet")
+        add(["45400", "45402", "45410", "45418", "45419"], "CSL 香港电讯", "CSL",
+            ["mobile", "hkcsl"])
+        add(["45500", "45501", "45502", "45503", "45504", "45505"], "CTM 澳门电讯", "CTM", ["ctmnet"])
+        add(["46601", "46692", "46693"], "Chunghwa 中华电信", "CHT", ["internet"])
+        add(["46697", "46699"], "Taiwan Mobile 台湾大哥大", "TWM", ["internet"])
+        add(["46688", "46689"], "FarEasTone 远传", "FET", ["internet"])
+        add(["310260", "310200", "310210", "310220", "310230", "310240", "310250", "310270", "310310", "310490"], "T-Mobile US", "T-Mobile", ["fast.t-mobile.com"])
+        add(["310410", "310150", "310170", "310380", "310560"], "AT&T", "AT&T", ["nxtgenphone"])
+        add(["311480", "310004", "310012", "310013"], "Verizon", "Verizon", ["vzwinternet"])
+        add(["26201", "26206", "26278"], "Telekom DE", "T-Mobile DE", ["internet.telekom"])
+        add(["26202", "26209", "26242"], "Vodafone DE", "Vodafone", ["web.vodafone.de"])
+        add(["26203", "26208", "26223", "26243"], "O2 DE", "O2", ["internet"])
+        add(["23410", "23430", "23433"], "EE UK", "EE", ["everytime"])
+        add(["23415", "23420", "23430"], "Vodafone UK", "Vodafone", ["internet"])
+        add(["23430", "23431"], "EE / Virgin UK", "EE", ["everytime"])
+        add(["44010", "44011", "44020"], "NTT docomo", "docomo", ["spmode.ne.jp"])
+        add(["44020", "44051", "44053"], "SoftBank JP", "SoftBank", ["plus.4g"])
+        add(["45005", "45008", "45000", "45002"], "SKT / KT KR", "KR", ["internet"])
         return map
     }()
 
@@ -84,7 +100,7 @@ public enum CarrierCatalog {
         if let exact = table[digits] { return exact }
         // Fall back to the 5-digit MCC+MNC when the module reports 6 digits.
         if digits.count >= 5, let short = table[String(digits.prefix(5))] { return short }
-        return Carrier(mccmnc: digits, name: "运营商 \(digits)", shortName: digits, apn: "",
+        return Carrier(mccmnc: digits, name: "运营商 \(digits)", shortName: digits, apns: [],
                        region: region(forMCC: String(digits.prefix(3))))
     }
 
@@ -102,7 +118,7 @@ public enum CarrierCatalog {
             if let exact = table[String(digits.prefix(length))] { return exact }
         }
         let mcc = String(digits.prefix(3))
-        return Carrier(mccmnc: mcc, name: "运营商 \(mcc)", shortName: mcc, apn: "",
+        return Carrier(mccmnc: mcc, name: "运营商 \(mcc)", shortName: mcc, apns: [],
                        region: region(forMCC: mcc))
     }
 
@@ -140,7 +156,7 @@ public enum CarrierCatalog {
         carrier(forMCCMNC: "45406"),
         carrier(forMCCMNC: "45400"),
         Carrier(mccmnc: "45400", name: "1010（CSL 旗下）", shortName: "1010",
-                apn: "mobile", region: .hongKong),
+                apns: ["mobile", "hkcsl"], region: .hongKong),
     ]
 
     /// Aliases firmware puts in `AT+COPS?`. Matching is substring-based because

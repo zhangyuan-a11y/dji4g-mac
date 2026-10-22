@@ -316,7 +316,7 @@ public final class ModemController {
                     // the modules that had managed to register.
                     let known = CarrierCatalog.carrier(forOperatorName: name)
                     fresh.carrier = known
-                        ?? Carrier(mccmnc: "", name: name, shortName: name, apn: "")
+                        ?? Carrier(mccmnc: "", name: name, shortName: name, apns: [])
                 }
             }
         }
@@ -498,7 +498,8 @@ public final class ModemController {
         // Nothing to go on. An APN already in the module is not made worse by
         // the fact that the operator could not be read, so keep it and say so
         // instead of blanking it.
-        guard !carrier.apn.isEmpty else {
+        let candidates = carrier.apns.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard !candidates.isEmpty else {
             if let existing, !existing.isEmpty {
                 emit(.note("读不到运营商，沿用模块里已有的接入点：\(existing)"))
                 return existing
@@ -506,24 +507,29 @@ public final class ModemController {
             throw APNError.noOperator
         }
 
-        if let existing, !existing.isEmpty,
-           existing.caseInsensitiveCompare(carrier.apn) == .orderedSame, !force {
+        if !force, let existing, !existing.isEmpty, carrier.matches(apn: existing) {
             emit(.note("接入点已经是 \(existing)（\(carrier.name)），无需改动"))
             return existing
         }
 
-        do {
-            try data.configureAPN(carrier.apn)
-        } catch {
-            // 写失败时把旧值写回去，别把模块留在半新不旧的状态里。
-            if let existing, !existing.isEmpty,
-               existing.caseInsensitiveCompare(carrier.apn) != .orderedSame {
-                _ = try? data.configureAPN(existing)
+        // 多个候选按优先级依次尝试：首选写不进就退到下一个，全部失败才报错。
+        var lastError: Error?
+        for candidate in candidates {
+            do {
+                try data.configureAPN(candidate)
+                emit(.note("已设置接入点为 \(candidate)（\(carrier.name)）"))
+                return candidate
+            } catch {
+                lastError = error
             }
-            throw APNError.writeFailed(carrier: carrier.name, apn: carrier.apn, reason: error)
         }
-        emit(.note("已设置接入点为 \(carrier.apn)（\(carrier.name)）"))
-        return carrier.apn
+        // 全部候选都失败：把旧值写回去，别把模块留在半新不旧的状态里。
+        if let existing, !existing.isEmpty, !carrier.matches(apn: existing) {
+            _ = try? data.configureAPN(existing)
+        }
+        throw APNError.writeFailed(carrier: carrier.name,
+                                   apn: candidates.joined(separator: "/"),
+                                   reason: lastError ?? DataError.invalidParameter("未知错误"))
     }
 
     // MARK: - Unsolicited handling

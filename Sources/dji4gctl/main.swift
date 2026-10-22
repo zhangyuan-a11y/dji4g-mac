@@ -1609,6 +1609,19 @@ func runHongKongSuite(_ check: (String, @autoclosure () -> Bool) -> Void) -> (pa
            CarrierCatalog.mainlandChina.map(\.apn) == ["CMNET", "3GNET", "CTNET", "CBNET"])
     verify("MCC 454 归香港", CarrierCatalog.region(forMCC: "454") == .hongKong)
     verify("MCC 460 归大陆", CarrierCatalog.region(forMCC: "460") == .mainlandChina)
+    // 多候选 APN：首选 + 备选都在，`apn` 是首选，`matches` 命中任一候选。
+    verify("SmarTone 有两个候选 APN（smartone / internet）",
+           CarrierCatalog.carrier(forMCCMNC: "45406").apns == ["smartone", "internet"])
+    verify("CSL 有两个候选 APN（mobile / hkcsl）",
+           CarrierCatalog.carrier(forMCCMNC: "45400").apns == ["mobile", "hkcsl"])
+    verify("首选 APN 是第一个候选",
+           CarrierCatalog.carrier(forMCCMNC: "45406").apn == "smartone")
+    verify("matches 命中备选候选（internet）",
+           CarrierCatalog.carrier(forMCCMNC: "45406").matches(apn: "internet"))
+    verify("matches 不命中别家的 APN（CMNET）",
+           !CarrierCatalog.carrier(forMCCMNC: "45406").matches(apn: "CMNET"))
+    verify("matches 忽略大小写（INTERNET）",
+           CarrierCatalog.carrier(forMCCMNC: "45406").matches(apn: "INTERNET"))
 
     // ── 2. IMSI 归属识别。
     verify("IMSI 45412 → CMHK", CarrierCatalog.carrier(forIMSI: "454120123456789").shortName == "CMHK")
@@ -2398,7 +2411,7 @@ func runOneShot(_ command: String, controller: ModemController) -> Int32 {
             let known = CarrierCatalog.mainlandChina + CarrierCatalog.hongKong
             if let carrier = known.first(where: {
                 $0.name == wanted || $0.shortName == wanted
-                    || $0.apn.caseInsensitiveCompare(wanted) == .orderedSame
+                    || $0.matches(apn: wanted)
             }) {
                 let apn = try controller.applyCarrierAPN(force: true, carrier: carrier)
                 print("  已写入 \(apn)（\(carrier.name)）")
