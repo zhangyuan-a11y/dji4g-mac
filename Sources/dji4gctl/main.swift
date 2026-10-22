@@ -1210,6 +1210,10 @@ func runSelfTest() -> Bool {
     passed += emptySlotResults.passed
     failed += emptySlotResults.failed
 
+    let hkResults = runHongKongSuite(check)
+    passed += hkResults.passed
+    failed += hkResults.failed
+
     let loginResults = runLoginItemSuite(check)
     passed += loginResults.passed
     failed += loginResults.failed
@@ -1576,6 +1580,113 @@ func runEmptySlotSuite(_ check: (String, @autoclosure () -> Bool) -> Void) -> (p
     return (passed, failed)
 }
 
+/// 香港 SIM 兼容性：运营商表、IMSI 归属、漫游时 APN 跟卡走、+852 号码处理。
+/// 全程跑在内存模拟模块上，不碰真机。
+func runHongKongSuite(_ check: (String, @autoclosure () -> Bool) -> Void) -> (passed: Int, failed: Int) {
+    var passed = 0
+    var failed = 0
+    func verify(_ name: String, _ condition: @autoclosure () -> Bool) {
+        let value = condition()
+        if value { passed += 1 } else { failed += 1 }
+        check(name, value)
+    }
+
+    banner("香港 SIM 兼容（模拟）")
+
+    // ── 1. 运营商表：APN 必须是对的，CMHK 不再是 CMNET、3HK 不再是 3gnet。
+    verify("CMHK APN = cmhk（不再错配成 CMNET）",
+           CarrierCatalog.carrier(forMCCMNC: "45412").apn == "cmhk")
+    verify("3HK APN = mobile.lte.three.com.hk（不再错配成 3gnet）",
+           CarrierCatalog.carrier(forMCCMNC: "45403").apn == "mobile.lte.three.com.hk")
+    verify("SmarTone APN = smartone",
+           CarrierCatalog.carrier(forMCCMNC: "45406").apn == "smartone")
+    verify("CSL APN = mobile",
+           CarrierCatalog.carrier(forMCCMNC: "45400").apn == "mobile")
+    verify("香港按钮列表含 CMHK / 3HK / SmarTone / CSL / 1010",
+           ["CMHK", "3HK", "SmarTone", "CSL", "1010"]
+               .allSatisfy { s in CarrierCatalog.hongKong.contains { $0.shortName == s } })
+    verify("大陆四家 APN 原样保留（CMNET/3GNET/CTNET/CBNET）",
+           CarrierCatalog.mainlandChina.map(\.apn) == ["CMNET", "3GNET", "CTNET", "CBNET"])
+    verify("MCC 454 归香港", CarrierCatalog.region(forMCC: "454") == .hongKong)
+    verify("MCC 460 归大陆", CarrierCatalog.region(forMCC: "460") == .mainlandChina)
+
+    // ── 2. IMSI 归属识别。
+    verify("IMSI 45412 → CMHK", CarrierCatalog.carrier(forIMSI: "454120123456789").shortName == "CMHK")
+    verify("IMSI 45403 → 3HK", CarrierCatalog.carrier(forIMSI: "454030123456789").shortName == "3HK")
+    verify("IMSI 45406 → SmarTone", CarrierCatalog.carrier(forIMSI: "454060123456789").shortName == "SmarTone")
+    verify("IMSI 45400 → CSL", CarrierCatalog.carrier(forIMSI: "454000123456789").shortName == "CSL")
+    verify("IMSI 46000 → 移动", CarrierCatalog.carrier(forIMSI: "460001234567890").shortName == "移动")
+    verify("未知 MCC（901）不给 APN（不猜）",
+           CarrierCatalog.carrier(forIMSI: "901700123456789").apn.isEmpty)
+    verify("空 IMSI 不给 APN", CarrierCatalog.carrier(forIMSI: "").apn.isEmpty)
+
+    // ── 3. 香港卡在大陆漫游：APN 跟卡走，不跟驻留网络走。
+    do {
+        let sim = SimulatedATTransport()
+        sim.imsi = "454120123456789"       // CMHK 卡
+        sim.carrierMCCMNC = "46000"        // 驻留到大陆中国移动
+        sim.carrierName = "CHINA MOBILE"
+        sim.setRegistration(5)             // 漫游
+        let controller = ModemController(session: ATSession(factory: { sim }))
+        do { try controller.connect() }
+        catch {
+            verify("连接漫游模拟模块（\(error)）", false)
+            return (passed, failed)
+        }
+        verify("SIM 归属识别为 CMHK", controller.sim.homeCarrier.shortName == "CMHK")
+        verify("驻留网络识别为中国移动", controller.network.carrier.shortName == "移动")
+        verify("识别为漫游", controller.network.isRoaming)
+        do {
+            let apn = try controller.applyCarrierAPN(force: true)
+            verify("漫游时写的是 cmhk 不是 CMNET（\(apn)）", apn == "cmhk")
+        } catch {
+            verify("漫游时写的是 cmhk（异常：\(error)）", false)
+        }
+        controller.disconnect()
+    }
+
+    // ── 4. 识别不出运营商 → 不猜，拒绝写入。
+    do {
+        let sim = SimulatedATTransport()
+        sim.imsi = "901700123456789"
+        sim.carrierName = "SOME NETWORK"
+        let controller = ModemController(session: ATSession(factory: { sim }))
+        do { try controller.connect() }
+        catch {
+            verify("连接未知卡模拟模块（\(error)）", false)
+            return (passed, failed)
+        }
+        verify("未知卡归属无 APN", controller.sim.homeCarrier.apn.isEmpty)
+        let before = (try? controller.data.readAPN()) ?? nil
+        _ = try? controller.applyCarrierAPN(force: true)
+        let after = (try? controller.data.readAPN()) ?? nil
+        verify("识别不出时不写 APN（\(before ?? "空") → \(after ?? "空")）", before == after)
+        controller.disconnect()
+    }
+
+    // ── 5. +852 号码：拨号与短信都不强制 +86。
+    do {
+        let pdu = try PDUSubmit.encode(text: "hi", to: "+85291234567").first ?? ""
+        let decoded = try PDUCodec.decodeSubmit(pdu)
+        verify("+852 短信收件人往返（\(decoded.sender)）", decoded.sender == "+85291234567")
+    } catch {
+        verify("+852 短信往返（异常：\(error)）", false)
+    }
+    do {
+        let sim = SimulatedATTransport()
+        let controller = ModemController(session: ATSession(factory: { sim }))
+        try controller.connect()
+        try controller.calls.dial("+85291234567")
+        verify("+852 拨号保留国际前缀（\(controller.calls.current.number)）",
+               controller.calls.current.number == "+85291234567")
+        controller.disconnect()
+    } catch {
+        verify("+852 拨号（异常：\(error)）", false)
+    }
+
+    return (passed, failed)
+}
+
 /// Decodes a sent (SMS-SUBMIT) PDU through the same code path the app uses,
 /// so the round-trip test exercises production decoding rather than a rewrite.
 func stripAndDecodeSubmit(_ tpdu: [UInt8], index: Int) -> SMSMessage {
@@ -1912,14 +2023,16 @@ func apnReport(_ controller: ModemController) -> String {
     if let existing = (try? controller.data.readAPN()) ?? nil, !existing.isEmpty {
         return "  当前 APN：\(existing)"
     }
-    let carrier = controller.network.carrier
+    // 推荐按卡的归属配，不按驻留网络配：香港卡漫游时驻留是中国移动。
+    let home = controller.sim.homeCarrier
+    let carrier = home.apn.isEmpty ? controller.network.carrier : home
     if !carrier.apn.isEmpty {
         return "  模块里还没有 APN。这台模块认到的运营商是\(carrier.name)，\n"
             + "  写入：dji4gctl apn \(carrier.apn)"
     }
     return "  模块里还没有 APN，也读不到运营商（多半是还没插卡）。\n"
         + "  插卡后跑 dji4gctl apn 自动认运营商；\n"
-        + "  或现在就指定一家：dji4gctl apn 移动 / 联通 / 电信 / 广电"
+        + "  或现在就指定一家：dji4gctl apn 移动 / 联通 / 电信 / 广电 / cmhk / 3hk"
 }
 
 func runOneShot(_ command: String, controller: ModemController) -> Int32 {
@@ -2280,7 +2393,10 @@ func runOneShot(_ command: String, controller: ModemController) -> Int32 {
         banner("APN")
         if let wanted = argumentsAfter(command, in: arguments).first {
             // 运营商简称/全称/APN 名都认：「apn 电信」和「apn CTNET」是一回事。
-            if let carrier = CarrierCatalog.mainlandChina.first(where: {
+            // 香港那几家也进同一张表：「apn cmhk」按 CMHK 配，而不是把字面
+            // "cmhk" 当 APN 写进去（那和直接手填 APN 是两条路）。
+            let known = CarrierCatalog.mainlandChina + CarrierCatalog.hongKong
+            if let carrier = known.first(where: {
                 $0.name == wanted || $0.shortName == wanted
                     || $0.apn.caseInsensitiveCompare(wanted) == .orderedSame
             }) {

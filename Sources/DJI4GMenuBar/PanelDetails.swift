@@ -73,6 +73,18 @@ struct NetworkDetail: View {
                            ? "--" : model.network.accessTechnology),
                      Field(caption: "频段", value: model.network.band.isEmpty
                            ? "--" : model.network.band))
+            // SIM 归属（卡是哪家的）与当前驻留网络（现在连到哪家）分开摆：
+            // 香港卡在大陆漫游时这两格会不一样，不能混成一个「运营商」。
+            tableRow(Field(caption: "SIM 归属",
+                           value: model.sim.homeCarrier.apn.isEmpty
+                               ? "--" : model.sim.homeCarrier.shortName),
+                     Field(caption: "当前网络",
+                           value: model.network.carrier.name.isEmpty
+                               ? "--" : model.network.carrier.shortName),
+                     Field(caption: "漫游",
+                           value: model.isConnected
+                               ? (model.network.isRoaming ? "漫游中" : "本地")
+                               : "--"))
             tableRow(Field(caption: "RSRP",
                            value: model.signal.rsrp.map { String(format: "%.0f dBm", $0) } ?? "--"),
                      Field(caption: "RSRQ",

@@ -276,6 +276,9 @@ public final class ModemController {
             if fresh.imsi.isEmpty, !fresh.iccid.isEmpty, fresh.iccid == previous.iccid {
                 fresh.imsi = previous.imsi
             }
+            // 归属运营商只跟 IMSI 走：漫游时驻留网络会变（见 `NetworkStatus.
+            // carrier`），但卡是哪家的、APN 该配哪家的一辈子不变。
+            fresh.homeCarrier = CarrierCatalog.carrier(forIMSI: fresh.imsi)
         }
         sim = fresh
         emit(.sim(fresh))
@@ -476,7 +479,20 @@ public final class ModemController {
     /// the three operator buttons used to be.
     @discardableResult
     public func applyCarrierAPN(force: Bool = false, carrier chosen: Carrier? = nil) throws -> String {
-        let carrier = chosen ?? network.carrier
+        // APN 跟「卡的归属运营商」走，不跟「当前驻留网络」走。
+        //
+        // 手动按钮（chosen 非空）永远优先；自动路则先认 IMSI 推出的归属。
+        // 香港卡在大陆漫游时，`network.carrier` 报的是中国移动（驻留网络），
+        // 照它写 CMNET 等于把香港卡写坏 —— 归属是 CMHK 就该写 cmhk。
+        let carrier: Carrier
+        if let chosen {
+            carrier = chosen
+        } else {
+            // 只看卡的归属。归属认不出来（IMSI 的 MCC/MNC 不在表里）时，
+            // 不拿驻留网络去猜 —— 外卡漫游到移动网，猜成 CMNET 就是写坏。
+            // 交给 `noOperator`：界面会引导客户去「自定义」里填 APN。
+            carrier = sim.homeCarrier
+        }
         let existing = (try? data.readAPN()) ?? nil
 
         // Nothing to go on. An APN already in the module is not made worse by
@@ -499,6 +515,11 @@ public final class ModemController {
         do {
             try data.configureAPN(carrier.apn)
         } catch {
+            // 写失败时把旧值写回去，别把模块留在半新不旧的状态里。
+            if let existing, !existing.isEmpty,
+               existing.caseInsensitiveCompare(carrier.apn) != .orderedSame {
+                _ = try? data.configureAPN(existing)
+            }
             throw APNError.writeFailed(carrier: carrier.name, apn: carrier.apn, reason: error)
         }
         emit(.note("已设置接入点为 \(carrier.apn)（\(carrier.name)）"))

@@ -1477,6 +1477,24 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// 客户手填一个 APN（香港虚拟运营商、或套餐 APN 与默认不同时）。
+    ///
+    /// 走 `DataService.configureAPN` 那道入参校验（引号/逗号/换行/空串都拦），
+    /// 写进去之后和手选运营商一样把主人记下来，自动路不再覆盖。
+    func applyCustomAPN(_ apn: String) {
+        let trimmed = apn.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            note("接入点不能为空")
+            return
+        }
+        run("设置接入点") {
+            try self.controller.data.configureAPN(trimmed)
+            self.rememberAPNOwner(manual: true)
+            self.note("接入点 = \(trimmed)")
+            _ = self.controller.refreshData()
+        }
+    }
+
     /// 卡插上、模块报出运营商之后，自动把 APN 写进模块 —— 客户不用自己点
     /// AUTO，打开 4G 就能联网。
     ///
@@ -1529,9 +1547,12 @@ final class AppModel: ObservableObject {
         // 不能当成「上一手留下的」。
         if UserDefaults.standard.bool(forKey: AppModel.apnManualKey) { return false }
 
-        let carrier = controller.network.carrier
-        guard !carrier.apn.isEmpty else { return false }
-        return moduleAPN.caseInsensitiveCompare(carrier.apn) != .orderedSame
+        // 拿卡归属比，不拿驻留网络比：香港卡漫游到大陆时驻留是中国移动，
+        // 照它比会把 cmhk 误判成「别人的 APN」。
+        let home = controller.sim.homeCarrier
+        let reference = home.apn.isEmpty ? controller.network.carrier : home
+        guard !reference.apn.isEmpty else { return false }
+        return moduleAPN.caseInsensitiveCompare(reference.apn) != .orderedSame
     }
 
     /// 把「模块里这个 APN 是给哪张卡写的」记下来。

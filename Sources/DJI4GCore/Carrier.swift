@@ -1,20 +1,34 @@
 import Foundation
 
+/// 卡的归属地区。由 MCC（IMSI 前三位 / MCC+MNC 前三位）推出，和「当前驻留
+/// 网络」是两回事 —— 香港卡在大陆漫游时，归属地区仍是香港。
+public enum CarrierRegion: String, Equatable {
+    case mainlandChina = "中国大陆"
+    case hongKong = "中国香港"
+    case macau = "中国澳门"
+    case other = "其他地区"
+    case unknown = "未知"
+}
+
 /// MCC/MNC → carrier identity plus the APN the module should use on it.
-public struct Carrier: Equatable {
+public struct Carrier: Equatable, Hashable {
     public let mccmnc: String
     public let name: String
     public let shortName: String
     public let apn: String
+    public let region: CarrierRegion
 
-    public init(mccmnc: String, name: String, shortName: String, apn: String) {
+    public init(mccmnc: String, name: String, shortName: String, apn: String,
+                region: CarrierRegion = .unknown) {
         self.mccmnc = mccmnc
         self.name = name
         self.shortName = shortName
         self.apn = apn
+        self.region = region
     }
 
-    public static let unknown = Carrier(mccmnc: "", name: "未知运营商", shortName: "未知", apn: "")
+    public static let unknown = Carrier(mccmnc: "", name: "未知运营商", shortName: "未知",
+                                        apn: "", region: .unknown)
 }
 
 public enum CarrierCatalog {
@@ -25,7 +39,9 @@ public enum CarrierCatalog {
         var map: [String: Carrier] = [:]
         func add(_ codes: [String], _ name: String, _ short: String, _ apn: String) {
             for code in codes {
-                map[code] = Carrier(mccmnc: code, name: name, shortName: short, apn: apn)
+                let region = CarrierCatalog.region(forMCC: String(code.prefix(3)))
+                map[code] = Carrier(mccmnc: code, name: name, shortName: short,
+                                    apn: apn, region: region)
             }
         }
         add(["46000", "46002", "46004", "46007", "46008"], "中国移动", "移动", "CMNET")
@@ -33,11 +49,16 @@ public enum CarrierCatalog {
         add(["46001", "46006", "46009"], "中国联通", "联通", "3GNET")
         add(["46015", "46020"], "中国广电", "广电", "CBNET")
 
-        add(["45400", "45402", "45410", "45418"], "CMHK 中国移动香港", "CMHK", "CMNET")
-        add(["45412", "45413"], "China Mobile HK", "CMHK", "CMNET")
-        add(["45403", "45404", "45405"], "Hutchison HK", "3HK", "3gnet")
-        add(["45406", "45415", "45416"], "SmarTone HK", "SMT", "smartone")
-        add(["45419"], "CSL HK", "CSL", "csl")
+        // ── 香港（MCC 454）。APN 用各家的官方默认；不同套餐可能不同，只在
+        //    自动识别**能确定**归属运营商时才写，绝不覆盖客户手改的 APN。
+        //    注意 CMHK 是「中国移动香港」，不是大陆中国移动 —— 以前错配成
+        //    CMNET（大陆 APN），香港卡插进去会上不了网。
+        add(["45412", "45413"], "中国移动香港 CMHK", "CMHK", "cmhk")
+        add(["45403", "45404", "45405"], "3香港 3HK", "3HK", "mobile.lte.three.com.hk")
+        add(["45406", "45415", "45416"], "数码通 SmarTone", "SmarTone", "smartone")
+        // CSL 与 1010 共用 MCC/MNC 454-00，按套餐可能不同；统一给 CSL 的官方
+        // 默认 mobile，1010 作为可选按钮单独列出。
+        add(["45400", "45402", "45410", "45418", "45419"], "CSL 香港电讯", "CSL", "mobile")
         add(["45500", "45501", "45502", "45503", "45504", "45505"], "CTM 澳门电讯", "CTM", "ctmnet")
         add(["46601", "46692", "46693"], "Chunghwa 中华电信", "CHT", "internet")
         add(["46697", "46699"], "Taiwan Mobile 台湾大哥大", "TWM", "internet")
@@ -63,7 +84,37 @@ public enum CarrierCatalog {
         if let exact = table[digits] { return exact }
         // Fall back to the 5-digit MCC+MNC when the module reports 6 digits.
         if digits.count >= 5, let short = table[String(digits.prefix(5))] { return short }
-        return Carrier(mccmnc: digits, name: "运营商 \(digits)", shortName: digits, apn: "")
+        return Carrier(mccmnc: digits, name: "运营商 \(digits)", shortName: digits, apn: "",
+                       region: region(forMCC: String(digits.prefix(3))))
+    }
+
+    /// 从 IMSI 推出**卡的归属运营商**。IMSI = MCC(3) + MNC(2~3) + MSIN，
+    /// 所以先按 6 位、再按 5 位在表里找，找不到时退回「只知道地区」。
+    ///
+    /// 与 `carrier(forMCCMNC:)` 的区别：那条吃的是 `AT+QNWINFO` / `AT+COPS?`
+    /// 里的**驻留网络**编号，这条吃的是卡自己身上的 IMSI。香港卡在大陆漫游
+    /// 时，两条会给出完全不同的答案 —— APN 必须跟卡走，不跟驻留网络走。
+    public static func carrier(forIMSI imsi: String?) -> Carrier {
+        guard let imsi, !imsi.isEmpty else { return .unknown }
+        let digits = imsi.filter { $0.isNumber }
+        guard digits.count >= 5 else { return .unknown }
+        for length in [6, 5] where digits.count >= length {
+            if let exact = table[String(digits.prefix(length))] { return exact }
+        }
+        let mcc = String(digits.prefix(3))
+        return Carrier(mccmnc: mcc, name: "运营商 \(mcc)", shortName: mcc, apn: "",
+                       region: region(forMCC: mcc))
+    }
+
+    /// MCC → 归属地区。
+    public static func region(forMCC mcc: String?) -> CarrierRegion {
+        switch mcc {
+        case "460": return .mainlandChina
+        case "454": return .hongKong
+        case "455": return .macau
+        case "466": return .other
+        default: return .unknown
+        }
     }
 
     /// The buttons on the settings window, in the order they are drawn.
@@ -80,16 +131,34 @@ public enum CarrierCatalog {
         carrier(forMCCMNC: "46015"),
     ]
 
+    /// 香港运营商的按钮顺序。1010 与 CSL 共用 454-00，单独列出来让客户能
+    /// 按套餐名选；APN 默认都给 `mobile`（1010 部分套餐是 `hkcsl`，客户可
+    /// 在自定义里改）。
+    public static let hongKong: [Carrier] = [
+        carrier(forMCCMNC: "45412"),
+        carrier(forMCCMNC: "45403"),
+        carrier(forMCCMNC: "45406"),
+        carrier(forMCCMNC: "45400"),
+        Carrier(mccmnc: "45400", name: "1010（CSL 旗下）", shortName: "1010",
+                apn: "mobile", region: .hongKong),
+    ]
+
     /// Aliases firmware puts in `AT+COPS?`. Matching is substring-based because
     /// the answer arrives decorated ("CHINA MOBILE", "CHN-UNICOM", "CMCC"…).
     private static let nameAliases: [(alias: String, mccmnc: String)] = [
+        // 香港的先判，且「中国移动香港 / CMHK」必须排在「中国移动 / CMCC」
+        // 前面 —— 后者的名字是前者的子串，顺序反了会把香港卡认成大陆移动。
+        ("CHINA MOBILE HONG KONG", "45412"), ("CHINA MOBILE HK", "45412"),
+        ("CMHK", "45412"), ("中国移动香港", "45412"),
+        ("3 HONG KONG", "45403"), ("HUTCHISON", "45403"), ("3HK", "45403"),
+        ("SMARTONE", "45406"), ("SMC", "45406"), ("数码通", "45406"),
+        ("PCCW", "45419"), ("HKT", "45419"), ("CSL", "45400"),
+        ("1010", "45400"), ("香港电讯", "45400"),
         ("CHINA MOBILE", "46000"), ("CHN-MOBILE", "46000"), ("CMCC", "46000"),
         ("CHINA UNICOM", "46001"), ("CHN-CUGSM", "46001"), ("UNICOM", "46001"),
         ("CHINA TELECOM", "46003"), ("CHN-CT", "46003"),
         ("CHINA BROADNET", "46015"), ("BROADNET", "46015"), ("CBN", "46015"),
-        // 有些固件把运营商名写成中文，面板上看到的就是这几个字。带「香港」
-        // 的那条必须排在「中国移动」前面 —— 它的名字里也含这四个字。
-        ("中国移动香港", "45412"),
+        // 有些固件把运营商名写成中文，面板上看到的就是这几个字。
         ("中国移动", "46000"), ("中国联通", "46001"),
         ("中国电信", "46003"), ("中国广电", "46015"),
     ]
@@ -179,6 +248,18 @@ public struct NetworkStatus: Equatable {
     public var rawNetworkInfo: String = ""
 
     public init() {}
+
+    /// 是否在漫游。数据域和电路域任一报「漫游注册」（`+CREG` / `+CEREG`
+    /// 第 2 格 = 5）就算 —— 香港卡在大陆用、大陆卡在境外用都落在这里。
+    public var isRoaming: Bool {
+        registration == .registeredRoaming || packetRegistration == .registeredRoaming
+    }
+
+    /// 卡在境外、但没在网（或只在搜索）时的「可能漫游」提示，给界面解释
+    /// 「为什么上不了网」用。
+    public var roamingLabel: String {
+        isRoaming ? "漫游中" : "本地"
+    }
 
     /// 数据通不通看分组域：`AT+CEREG?`（LTE）/`AT+CGREG?`（GPRS）。
     ///
@@ -290,6 +371,9 @@ public struct SIMStatus: Equatable {
     public var imsi: String = ""
     public var iccid: String = ""
     public var ownNumber: String = ""
+    /// 卡的**归属运营商**，从 IMSI 推出。与 `NetworkStatus.carrier`（当前驻留
+    /// 网络）是两回事 —— 漫游时归属不变、驻留会变。
+    public var homeCarrier: Carrier = .unknown
     public var rawResponse: String = ""
     /// `AT+QSIMSTAT?` 的卡座检测位：插槽里到底有没有卡。nil ＝ 模块没回答。
     public var detectedInserted: Bool?

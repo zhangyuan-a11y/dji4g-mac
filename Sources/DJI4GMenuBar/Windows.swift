@@ -2,6 +2,17 @@ import SwiftUI
 import AppKit
 import DJI4GCore
 
+/// 「运营商」那一栏先按地区分：自动识别（默认）/ 中国大陆 / 中国香港 /
+/// 自定义。香港与大陆是两套卡、两套 APN，混在一个列表里客户反而点错。
+private enum OperatorRegion: String, CaseIterable, Identifiable {
+    case auto = "自动识别"
+    case mainland = "大陆"
+    case hongKong = "香港"
+    case custom = "自定义"
+
+    var id: String { rawValue }
+}
+
 /// Dial, answer, hang up, and route the call audio to the module.
 struct CallWindow: View {
     @EnvironmentObject private var model: AppModel
@@ -381,6 +392,8 @@ struct SetupWindow: View {
     @EnvironmentObject private var model: AppModel
     @State private var quotaText = ""
     @State private var showLog: Bool
+    @State private var operatorRegion: OperatorRegion = .auto
+    @State private var customAPN = ""
     private let debugExpanded: Bool
 
     /// `logExpanded` 只有截图会传：运行日志默认收起，而它的展开态也得留一张
@@ -507,51 +520,47 @@ struct SetupWindow: View {
 
             Divider()
 
-            // One button per operator, each writing *its own* APN. The three
-            // used to call the same "look at the card" path with the name
-            // thrown away, so on a module that could not yet read the card
-            // (no card in, or not registered) they did nothing at all.
+            // 运营商按地区分组：自动识别（默认）先认卡，认不出再手选地区。
+            // 香港卡和大陆卡是两套 APN，混在一个列表里客户会点错 —— 这正是
+            // CMHK 曾被当成大陆移动、3HK 曾被配成 3GNET 的根子。
             SetupRow(title: "运营商",
                      note: model.isConnected ? "" : "先连上模块",
-                     // 没连上模块时这四个按钮是灰的。提示原来只有一个版本，
-                     // 念的是「直接点上面那一家就行」—— 客户会去点一个点不动的
-                     // 按钮，然后以为是自己点错了地方（2026-09-25 复核 `--nomodule`
-                     // 那一档时发现：四个按钮是灰的，提示却在教他点）。
-                     // 2026-09-30：标题从 `APN` 换成「运营商」。这四个按钮上写
-                     // 的就是运营商的名字，客户点之前只需要知道「按是哪一家配」；
-                     // 缩写留给排障，不进客户界面。
                      help: model.isConnected
-                         ? "卡认不出来是哪一家的时候，点对应那一家就行。"
-                         : "模块连上以后这四个按钮才能点。卡还没认到也不影响 —— "
+                         ? "默认自动识别。认不出卡是哪一家、或要用套餐专属 APN 时，"
+                           + "先选地区再点对应那一家；虚拟运营商在「自定义」里填 APN。"
+                         : "模块连上以后才能点。卡还没认到也不影响 —— 选地区、"
                            + "点哪一家就按哪一家配置。") {
-                HStack(spacing: 5) {
-                    ForEach(CarrierCatalog.mainlandChina, id: \.mccmnc) { carrier in
-                        let active = apnActive(for: carrier)
-                        Button(carrier.shortName) { model.applyCarrierAPN(force: true, carrier: carrier) }
-                            .label(9)
-                            .buttonStyle(.plain)
-                            .disabled(!model.isConnected)
-                            .foregroundStyle(apnTint(for: carrier))
-                            // 2026-09-26：这四个原来只是四段彩色文字，客人根本看不出
-                            // 能点（复核截图时「移动 联通 电信 广电」读起来像一行说明）。
-                            // 补一圈胶囊轮廓，和面板上其它按钮同一个视觉语汇：正在用的
-                            // 那家描绿边、铺极浅绿底，其余白面灰边。模块没连上时整颗
-                            // 一起压暗 —— 只灰文字、留一圈实边框，反而更像能按。
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 3.5)
-                            .background(
-                                Capsule()
-                                    .fill(active ? Theme.phosphorInk.opacity(0.14) : Theme.chromeHi)
-                                    .overlay(
-                                        Capsule().strokeBorder(
-                                            active ? Theme.phosphorInk.opacity(0.75)
-                                                   : Theme.chromeEdgeStrong,
-                                            lineWidth: 1.2
-                                        )
-                                    )
-                            )
-                            .opacity(model.isConnected ? 1 : 0.55)
-                            .help("按 \(carrier.name) 配置上网参数（\(carrier.apn)）")
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 5) {
+                        ForEach(OperatorRegion.allCases) { region in
+                            let active = operatorRegion == region
+                            Button(region.rawValue) { operatorRegion = region }
+                                .label(9)
+                                .buttonStyle(.plain)
+                                .foregroundStyle(active ? Theme.phosphorInk : Theme.ink)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 3.5)
+                                .background(
+                                    Capsule()
+                                        .fill(active ? Theme.phosphorInk.opacity(0.14) : Theme.chromeHi)
+                                        .overlay(
+                                            Capsule().strokeBorder(
+                                                active ? Theme.phosphorInk.opacity(0.75)
+                                                       : Theme.chromeEdgeStrong,
+                                                lineWidth: 1.2))
+                                )
+                        }
+                    }
+
+                    switch operatorRegion {
+                    case .auto:
+                        autoOperatorControl
+                    case .mainland:
+                        operatorButtons(CarrierCatalog.mainlandChina)
+                    case .hongKong:
+                        operatorButtons(CarrierCatalog.hongKong)
+                    case .custom:
+                        customAPNControl
                     }
                 }
             }
@@ -687,6 +696,85 @@ struct SetupWindow: View {
     private func apnActive(for carrier: Carrier) -> Bool {
         model.isConnected
             && model.data.apn.caseInsensitiveCompare(carrier.apn) == .orderedSame
+    }
+
+    /// 自动识别：一个按钮按下就用「卡归属运营商」配 APN；旁边一行字把当前
+    /// 认到的卡和网络摆出来，让客户知道程序看到了什么。
+    @ViewBuilder
+    private var autoOperatorControl: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                RowButton(model.isConnected ? "自动识别" : "自动识别", isEnabled: model.isConnected) {
+                    model.applyCarrierAPN(force: true, carrier: nil)
+                }
+                Text(autoDetectCaption)
+                    .label(9)
+                    .foregroundStyle(Theme.inkNote)
+            }
+        }
+    }
+
+    private var autoDetectCaption: String {
+        let home = model.sim.homeCarrier
+        if home.apn.isEmpty {
+            let current = model.network.carrier.name
+            return current.isEmpty ? "还没认到运营商" : "驻留网络：\(current)"
+        }
+        let roaming = model.network.isRoaming ? "（漫游）" : ""
+        let current = model.network.carrier.name
+        var text = "SIM 归属：\(home.name)\(roaming)"
+        if !current.isEmpty, current != home.name { text += " · 驻留：\(current)" }
+        return text
+    }
+
+    /// 一列运营商按钮，每个写自己的 APN。
+    @ViewBuilder
+    private func operatorButtons(_ carriers: [Carrier]) -> some View {
+        HStack(spacing: 5) {
+            ForEach(carriers, id: \.self) { carrier in
+                let active = apnActive(for: carrier)
+                Button(carrier.shortName) { model.applyCarrierAPN(force: true, carrier: carrier) }
+                    .label(9)
+                    .buttonStyle(.plain)
+                    .disabled(!model.isConnected)
+                    .foregroundStyle(apnTint(for: carrier))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 3.5)
+                    .background(
+                        Capsule()
+                            .fill(active ? Theme.phosphorInk.opacity(0.14) : Theme.chromeHi)
+                            .overlay(
+                                Capsule().strokeBorder(
+                                    active ? Theme.phosphorInk.opacity(0.75)
+                                           : Theme.chromeEdgeStrong,
+                                    lineWidth: 1.2))
+                    )
+                    .opacity(model.isConnected ? 1 : 0.55)
+                    .help("按 \(carrier.name) 配置上网参数（\(carrier.apn)）")
+            }
+        }
+    }
+
+    /// 自定义 APN：给香港虚拟运营商、或套餐 APN 与默认不同的卡。
+    @ViewBuilder
+    private var customAPNControl: some View {
+        HStack(spacing: 6) {
+            TextField("", text: $customAPN)
+                .textFieldStyle(.plain)
+                .ownPlaceholder("例如 mobile.lte.three.com.hk", size: 12,
+                                shows: customAPN.isEmpty)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 7)
+                        .fill(Theme.chromeHi)
+                        .overlay(RoundedRectangle(cornerRadius: 7)
+                            .strokeBorder(Theme.chromeEdgeStrong, lineWidth: 1))
+                )
+            RowButton("保存", isEnabled: model.isConnected && !customAPN.isEmpty) {
+                model.applyCustomAPN(customAPN)
+            }
+        }
     }
 }
 
