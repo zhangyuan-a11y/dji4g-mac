@@ -1,0 +1,42 @@
+<Window x:Class="DJI4G.Windows.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="DJI 4G"
+        Width="380" Height="520"
+        MinWidth="340" MinHeight="420"
+        WindowStartupLocation="CenterScreen"
+        ShowInTaskbar="True"
+        Closing="OnClosing">
+    <!-- 使用系统默认标题栏：右上角最小化 / 最大化 / 关闭是 Windows 原生控件，不自定义 -->
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Orientation="Horizontal">
+            <Ellipse x:Name="StatusDot" Width="10" Height="10" Fill="Gray" VerticalAlignment="Center"/>
+            <TextBlock x:Name="StatusText" Margin="10,0,0,0" FontSize="16" FontWeight="SemiBold"
+                       VerticalAlignment="Center" Text="正在检测模块…"/>
+        </StackPanel>
+
+        <TextBlock x:Name="CarrierText" Grid.Row="1" Margin="0,10,0,0" FontSize="13"
+                   Foreground="{StaticResource TextSecondaryBrush}" Text="—"/>
+
+        <UniformGrid Grid.Row="2" Columns="3" Margin="0,18,0,0">
+            <Button x:Name="SmsButton" Content="短信" Margin="0,0,4,0" Click="SmsButton_Click"/>
+            <Button x:Name="CallButton" Content="电话" Margin="2,0,2,0" Click="CallButton_Click"/>
+            <Button x:Name="NetButton" Content="联网" Margin="4,0,0,0" Click="NetButton_Click"/>
+        </UniformGrid>
+
+        <ListBox x:Name="MessageList" Grid.Row="3" Margin="0,18,0,0"
+                 Background="{StaticResource CardBackgroundBrush}"
+                 BorderBrush="{StaticResource DividerBrush}"/>
+
+        <Button x:Name="RefreshButton" Grid.Row="4" Content="刷新状态" Margin="0,18,0,0"
+                Style="{StaticResource AccentButton}" Click="RefreshButton_Click"/>
+    </Grid>
+</Window>

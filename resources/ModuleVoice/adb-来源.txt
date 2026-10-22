@@ -1,0 +1,18 @@
+adb —— 通话语音安装用到的模块侧入口
+=====================================
+
+这一份 adb 是从 Android SDK Platform-Tools 里原样复制的（universal 二进制，
+x86_64 + arm64 都在，Intel Mac 和 M 系列 Mac 都能跑），**没有改动过**。
+
+  · 来源：Android SDK Platform-Tools
+  · 版本：见 source.properties（37.0.1-15733141）
+  · 许可：Apache License 2.0，全文见同目录的 adb-NOTICE.txt
+  · 大小：约 18 MB
+
+为什么要随包发一份：客户的 Mac 上通常没有 platform-tools，而通话语音必须
+通过模块上的 adb 才能装（见 docs/ARCHITECTURE.md）。让客户先去装一个 SDK
+再回来点「一键安装」是不现实的，所以这里自带一份。
+
+它只在装/查通话语音时被调用，用的端口是 5039（不是 5037），不会踢掉客户
+自己正在调试的其他设备。
+

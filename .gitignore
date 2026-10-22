@@ -1,0 +1,8 @@
+.build/
+.build-arm64/
+.buildhome/
+build-universal/
+DJI4G.app/
+DerivedData/
+*.xcuserdata
+.DS_Store

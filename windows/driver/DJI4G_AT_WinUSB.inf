@@ -1,0 +1,42 @@
+; DJI 4G 模块 AT 口 → WinUSB（仅开发/内测用，正式交付改用 Quectel 官方签名驱动）
+; 用前按真机接口描述符校准：VID/PID 与 MI_xx（AT 接口号）
+[Version]
+Signature = "$Windows NT$"
+Class     = USBDevice
+ClassGuid = {88BAE032-5A81-49F0-BC3D-A4FF138216D6}
+Provider  = %ProviderName%
+CatalogFile = DJI4G_AT.cat
+DriverVer = 09/26/2026,1.0.0.0
+
+[Manufacturer]
+%ProviderName% = Devices, NTamd64
+
+[Devices]
+%DeviceName% = USB_Install, USB\VID_2CA3&PID_4006&MI_02
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+[USB_Install.HW]
+AddReg = HwReg
+
+[HwReg]
+HKR,,NTMPDriver,,winusb.sys
+
+[Strings]
+ProviderName = "DJI4G"
+DiskName     = "DJI 4G AT WinUSB Install Disk"
+DeviceName   = "DJI 4G Module AT Port"
