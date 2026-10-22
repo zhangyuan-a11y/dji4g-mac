@@ -300,7 +300,10 @@ for kv in "PINNED_ZIP_SHA256=${PIN_APP}" "PINNED_DIAGNOSE_SHA256=${PIN_DIAG}" \
   KEY="${kv%%=*}"
   /usr/bin/sed -i '' -E "s|^${KEY}=.*$|${kv}|" "${DEL}/install.sh"
 done
-grep -q 'PLACEHOLDER' "${DEL}/install.sh" \
+# 只查四个钉子的赋值行。裸 grep 'PLACEHOLDER' 会把 install.sh 里
+# pinned_ok() 自己的 `!= "PLACEHOLDER"` 判断也匹配进来，永远误判。
+grep -qE '^PINNED_(ZIP|DIAGNOSE|UNINSTALL|README)_SHA256="?PLACEHOLDER"?' \
+  "${DEL}/install.sh" \
   && die "install.sh 里还有没写进去的完整性钉子，禁止出包。"
 say "安装脚本完整性钉子已写入"
 
