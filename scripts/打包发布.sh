@@ -215,20 +215,17 @@ done
 say "图标已就位（AppIcon.icns + CFBundleIconFile）"
 
 # ── 3. 重签 ─────────────────────────────────────────────────────
-# 顺序不能反：bundle 的签名覆盖里面的可执行文件，先签里面那个再签外层，
-# 否则 --verify --deep --strict 会说「资源被改过」。
-# 2026-09-30：改走 scripts/sign-app.sh —— 有固定证书就用固定证书。临时签名的
-# 身份是 cdhash，客户每装一次新版本，之前点过的麦克风授权就作废（系统的授权框
-# 一辈子只弹一次），表现成「昨天还能打电话，今天没声音」。固定证书的身份是
-# certificate root，装多少遍授权都还在。没有证书时它自己退回临时签名。
+# 统一走 scripts/sign-app.sh：它对 .app 是「先内后外」—— 包里每个 Mach-O
+# （主程序、dji4gctl、adb）先用同一张证书逐个签，再签外层。只靠 codesign
+# --deep 不会覆盖 Google 签好的 adb，会留下混合签名，macOS 26+ 的
+# --verify --deep --strict 判失败（客户机 macOS 27.0.1 的「签名校验没过」）。
+# 有固定证书就用固定证书，没有则退回临时签名 —— 详见 sign-app.sh。
 sign_one() {
   local APP="$1"
-  [ -f "${APP}/Contents/Resources/dji4gctl" ] && \
-    "${ROOT}/scripts/sign-app.sh" "${APP}/Contents/Resources/dji4gctl" >/dev/null 2>&1 || true
-  "${ROOT}/scripts/sign-app.sh" "${APP}/Contents/MacOS/DJI4GMenuBar" >/dev/null 2>&1 || true
-  "${ROOT}/scripts/sign-app.sh" --deep "${APP}" >/dev/null 2>&1 || true
+  "${ROOT}/scripts/sign-app.sh" "${APP}" >/dev/null 2>&1 \
+    || die "${APP} 签名失败。"
   codesign --verify --deep --strict "${APP}" >/dev/null 2>&1 \
-    || die "${APP} 签名校验没过，装到客户机器上会被系统杀掉。"
+    || die "${APP} 签名校验没过（嵌套二进制签名身份不一致，客户机 macOS 26+ 会拒绝）。"
   say "已重签并验证：${APP}"
 }
 sign_one "${SRC_APP}"

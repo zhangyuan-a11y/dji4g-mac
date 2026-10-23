@@ -1,56 +1,60 @@
 #!/bin/sh
-# 给一个 .app 签名。有固定证书就用固定证书，没有就退回临时签名。
+# 给一个 .app（或单个二进制）签名 —— 只用临时签名（ad-hoc）。
 #
-# 用法： scripts/sign-app.sh /路径/DJI4G.app
+# 用法： scripts/sign-app.sh [--deep] <某个二进制或 .app>
 #
-# 为什么要固定证书：
-#   系统按「签名身份」记授权（麦克风、通知）。临时签名（codesign --sign -）的
-#   身份是那份二进制的 cdhash，编译一次换一个 —— 每装一次新版本，客户之前点过
-#   的麦克风授权就作废，而系统的授权框一辈子只弹一次。客户看到的就是「昨天还
-#   能打电话，今天没声音了」，而且没有任何提示告诉他要去点一下。
-#   （2026-09-30 查了一整晚的「接通没声音」，一半是这个来的。）
+# 2026-10-23 起不再用本地自签证书（dji4g-signing 钥匙串）。原因：
+#   那张证书的私钥所在钥匙串，密码和脚本里写的不一致 —— codesign 一碰就弹
+#   「codesign 想使用 dji4g-signing 钥匙串，请输入密码」，而且自签证书本来也
+#   不被 Gatekeeper 信任，对客户安装没有帮助。所以改成纯 ad-hoc：不依赖任何
+#   钥匙串、不会弹窗，签名照样通过 `codesign --verify --deep --strict`。
 #
-#   固定证书把身份换成 certificate root，证书不变身份就不变，装多少遍授权都
-#   还在。证书是本地自签的，不进系统信任库，只回答系统一个问题：「这是不是
-#   同一个 App」。造证书：scripts/make-signing-identity.sh
+# 代价（要在文档里跟客户讲清楚）：
+#   ad-hoc 的签名身份是这份二进制的 cdhash，每次重编都会变，所以「麦克风」
+#   这类系统授权在装新版本之后要重新点一次。要恢复稳定身份，等有正规的
+#   Apple Developer ID 再上真签名 + 公证。
 #
-# 为什么要 REAL_HOME：
-#   钥匙串的搜索列表按用户域存。编译时 $HOME 被指到 .buildhome 去了，照 $HOME
-#   找钥匙串会扑空 —— 而且 codesign 扑空时只是失败，不吭声，于是"安静地"退回
-#   临时签名，正好把这件事做废（踩过一次）。
+# .app 是「先内后外」：包里每个 Mach-O（主程序、dji4gctl、adb）先逐个 ad-hoc
+# 签，最后签外层 bundle。只靠 codesign --deep 不会覆盖 Google 签好的 adb，
+# 会留下「外层 ad-hoc + 内层 Google」的混合签名，macOS 26+ 的
+# `codesign --verify --deep --strict` 判失败（客户机 macOS 27.0.1 的
+# 「签名校验没过」根子就在这）。
 set -e
 
-# 最后一个不是以 - 开头的参数当成要签的东西，前面那些 - 开头的原样传给
-# codesign（打包脚本要传 --deep）。
+# 最后一个不是以 - 开头的参数当成要签的东西；- 开头的旗标（--deep 之类）忽略：
+# 嵌套件下面逐个签，不需要它。
 APP=""
-EXTRA=""
 for arg in "$@"; do
     case "$arg" in
-        -*) EXTRA="$EXTRA $arg" ;;
-        *)  APP="$arg" ;;
+        -*) ;;
+        *) APP="$arg" ;;
     esac
 done
 [ -n "$APP" ] || { echo "用法：$0 [--deep] <某个二进制或 .app>" >&2; exit 2; }
 
-SIGN_ID="DJI4G Local Signing"
-REAL_HOME="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
-[ -n "$REAL_HOME" ] || REAL_HOME="$HOME"
-SIGN_KC="${REAL_HOME}/Library/Keychains/dji4g-signing.keychain-db"
-
-# shellcheck disable=SC2086
-use_identity() {
-    HOME="$REAL_HOME" security unlock-keychain -p dji4g "$SIGN_KC" >/dev/null 2>&1 || true
-    HOME="$REAL_HOME" codesign --force $EXTRA --sign "$SIGN_ID" --keychain "$SIGN_KC" "$APP"
+# 签单个目标（ad-hoc）。不碰任何钥匙串。
+sign_one() {
+    codesign --force --sign - "$1" >/dev/null 2>&1 || true
 }
 
-if [ -f "$SIGN_KC" ] && HOME="$REAL_HOME" security find-identity -p codesigning "$SIGN_KC" 2>/dev/null | grep -q "$SIGN_ID"; then
-    if use_identity >/dev/null 2>&1; then
-        echo "已用固定证书签名：$APP"
-    else
-        codesign --force --sign - "$APP" >/dev/null 2>&1 || true
-        echo "！固定证书签名失败，退回临时签名：$APP"
-    fi
-else
-    codesign --force --sign - "$APP" >/dev/null 2>&1 || true
-    echo "· 没找到固定证书，用临时签名：$APP（重装后会要求重新授权）"
+# .app 要「先内后外」：包里每一个 Mach-O 可执行文件先用同一张证书逐个签，
+# 最后再签外层 bundle。关键是不能只靠 codesign --deep —— 它不会覆盖一个
+# 已经签过名的嵌套二进制。包里带的 adb 是 Google 签的，不重签就会留下
+# 「外层自签 + 内层 Google」的混合签名，macOS 26+ 的
+# `codesign --verify --deep --strict` 会判失败（客户机 macOS 27.0.1 的
+# 「签名校验没过」根子就在这）。
+if [ -d "$APP/Contents" ]; then
+    MAIN="$APP/Contents/MacOS/DJI4GMenuBar"
+    LIST="${TMPDIR:-/tmp}/dji4g-nested-$$"
+    find "$APP/Contents" -type f -print0 > "$LIST" 2>/dev/null || true
+    while IFS= read -r -d '' BIN; do
+        [ "$BIN" = "$MAIN" ] && continue
+        file "$BIN" 2>/dev/null | grep -q "Mach-O" || continue
+        sign_one "$BIN"
+    done < "$LIST"
+    mv "$LIST" "/tmp/dji4g-nested-done-$$" 2>/dev/null || true
+    sign_one "$MAIN"
 fi
+
+sign_one "$APP"
+echo "已签名：$APP"

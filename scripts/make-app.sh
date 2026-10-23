@@ -102,7 +102,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# 签名走 scripts/sign-app.sh —— 有固定证书就用固定证书（重装不用重新授权），
-# 没有就退回临时签名。为什么固定证书要紧，那个脚本开头写清楚了。
+# 签名走 scripts/sign-app.sh —— 现在只用临时签名（ad-hoc），不再依赖
+# dji4g-signing 钥匙串（那张自签证书的钥匙串密码对不上，codesign 一碰就弹
+# 密码框；而且自签证书本来也不被 Gatekeeper 信任）。理由和代价见 sign-app.sh。
 sh "$(dirname "$0")/sign-app.sh" "$APP"
 echo "已生成 $APP"
