@@ -227,6 +227,11 @@ struct DJI4GApp: App {
         }
         .windowResizability(.contentSize)
 
+        Window("DJI 4G 网络诊断", id: WindowID.netdiag) {
+            NetDiagWindow().bringsWindowToFront(WindowID.netdiag)
+        }
+        .windowResizability(.contentSize)
+
         // 面板的「后路副本」：同一个 `PanelView`，但挂在一个真正的窗口上。
         //
         // 客户那台机器上面板弹不出来时，菜单栏里那条路就断了；这条不断 ——
@@ -251,6 +256,7 @@ enum WindowID {
     static let call = "dji4g.call"
     static let setup = "dji4g.setup"
     static let panel = "dji4g.panel"
+    static let netdiag = "dji4g.netdiag"
 }
 
 /// 独立面板窗口的内容。
@@ -583,6 +589,12 @@ struct MenuBarLabel: View {
         return [.symbol("antenna.radiowaves.left.and.right.slash")]
     }
 
+    /// 数据开关关掉、又不是来电/等待时，菜单栏图标该变灰。
+    /// 抽成纯函数，渲染自检里逐条钉边界（数据开/数据关/来电时数据关）。
+    static func shouldDim(dataWanted: Bool, callAlerting: Bool) -> Bool {
+        !dataWanted && !callAlerting
+    }
+
     /// 所有状态都从这一张图里出。
     ///
     /// 最后标成模板图：模板只取 alpha，颜色交给菜单栏自己决定，深色浅色
@@ -590,15 +602,22 @@ struct MenuBarLabel: View {
     static func image(for model: AppModel) -> NSImage {
         let pieces = parts(for: model).compactMap(bitmap)
         guard !pieces.isEmpty else { return SignalBars.image(bars: 0, height: labelHeight) }
+        // 数据开关关掉时整枚图标变灰：模板图只认 alpha，把每块按 0.4 的
+        // 不透明度合成，菜单栏上出来的就是「灰」。来电 / 等待那两档不跟着灰
+        // —— 那是紧急提示，和数据开关无关。
+        let callAlerting = model.call.state == .ringing || model.call.state == .waiting
+        let dimmed = Self.shouldDim(dataWanted: model.dataWanted, callAlerting: callAlerting)
         let width = pieces.reduce(0) { $0 + $1.size.width }
             + spacing * CGFloat(pieces.count - 1)
         let composed = NSImage(size: NSSize(width: width.rounded(), height: labelHeight),
                                flipped: false) { _ in
             var x: CGFloat = 0
+            let fraction: CGFloat = dimmed ? 0.4 : 1.0
             for piece in pieces {
                 let y = ((labelHeight - piece.size.height) / 2).rounded()
-                piece.draw(in: NSRect(x: x, y: y,
-                                      width: piece.size.width, height: piece.size.height))
+                let rect = NSRect(x: x, y: y,
+                                  width: piece.size.width, height: piece.size.height)
+                piece.draw(in: rect, from: .zero, operation: .sourceOver, fraction: fraction)
                 x += piece.size.width + spacing
             }
             return true

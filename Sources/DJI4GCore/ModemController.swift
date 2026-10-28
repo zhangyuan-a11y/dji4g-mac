@@ -443,6 +443,47 @@ public final class ModemController {
         return fresh
     }
 
+    /// 纯判断：模块这一侧样样都好，唯独 macOS 没给它枚举出网卡。
+    ///
+    /// 这种「卡在半路」的状态通常有两个来路：改完 usbcfg / usbnet 之后模块
+    /// 没做一次干净重启，或者 ECM 接口自己卡住了。客户物理拔插未必能救
+    /// （2026-10-26 客户实测拔了重插仍没网），而 `AT+CFUN=1,1` 是让模块全功能
+    /// 重启、重新枚举 USB 的最稳办法。
+    ///
+    /// 拆成纯函数是为了自检能逐条验证边界，不碰真模块。
+    public static func shouldResetForMissingInterface(
+        isConnected: Bool,
+        simReady: Bool,
+        dataRegistered: Bool,
+        usbnetMode: USBnetMode?,
+        compositionNetwork: Bool?,
+        hasInterface: Bool
+    ) -> Bool {
+        isConnected && simReady && dataRegistered
+            && usbnetMode == .ecm && compositionNetwork == true && !hasInterface
+    }
+
+    /// 满足 `shouldResetForMissingInterface` 就发一次 `AT+CFUN=1,1` 并返回 true；
+    /// 否则不动模块、返回 false。
+    ///
+    /// 调用方应已经 `refreshData()` 过，好让这里的 `data.status` 是刚读到的现场，
+    /// 而不是几秒前的缓存。重启会断开 AT 口约 20 秒，命令发出后拿不到 OK 属正常，
+    /// 所以用 `try?` 吞掉 —— 与 `prepare` / `usbnet` 里现有的重启写法一致。
+    @discardableResult
+    public func resurrectNetworkInterfaceIfStuck() -> Bool {
+        let status = data.status
+        guard Self.shouldResetForMissingInterface(
+            isConnected: isConnected,
+            simReady: sim.ready,
+            dataRegistered: network.dataRegistered,
+            usbnetMode: status.usbnetMode,
+            compositionNetwork: status.composition?.network,
+            hasInterface: status.hasInterface
+        ) else { return false }
+        _ = try? session.send("AT+CFUN=1,1", timeout: 3)
+        return true
+    }
+
     /// 高频、零 AT 的计数器刷新，专给面板上那个两秒一次的定时器用。
     ///
     /// 和 `refreshData()` 的分工是「完整」和「便宜」：`refreshData()` 会读
@@ -745,6 +786,15 @@ public final class ModemController {
                     }
                     if tick % max(1, refreshStatusEvery * 2) == 0 {
                         _ = try? self.refreshNetwork()
+                        _ = try? self.refreshCalls()
+                    }
+                    // 通话期间 CLCC 兜底刷新：URC（NO CARRIER）正常时一秒钟内就
+                    // 更新；URC 丢了，靠这条在 3 秒内发现远端挂断，而不是干等
+                    // 30 秒的整体刷新。只在真有通话在走时问，不堵空闲时的 AT 口。
+                    // `refreshCalls()` 读 `AT+CLCC`，查询超时只会抛错被 `try?`
+                    // 吃掉、**不会**把通话判成结束；只有 CLCC 明确回空才会结束。
+                    if tick % max(1, refreshStatusEvery / 5) == 0,
+                       self.calls.current.state.isBusy {
                         _ = try? self.refreshCalls()
                     }
                     // 「模块还在不在网」单独走快档：默认路由押在模块上的时候，

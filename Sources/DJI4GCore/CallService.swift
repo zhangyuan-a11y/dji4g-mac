@@ -64,18 +64,27 @@ public struct CallInfo: Equatable {
     public var state: CallState
     public var number: String
     public var startedAt: Date?
+    /// 单调时钟起点（`systemUptime`）。墙钟可能被改时间/NTP 调跳，通话时长
+    /// 必须用单调时钟算，进程内才不会忽长忽短。
+    public var startedUptime: TimeInterval?
 
     public init(index: Int = 0, direction: CallDirection = .unknown,
-                state: CallState = .idle, number: String = "", startedAt: Date? = nil) {
+                state: CallState = .idle, number: String = "", startedAt: Date? = nil,
+                startedUptime: TimeInterval? = nil) {
         self.index = index
         self.direction = direction
         self.state = state
         self.number = number
         self.startedAt = startedAt
+        self.startedUptime = startedUptime
     }
 
     public var duration: TimeInterval? {
-        guard state == .active, let startedAt else { return nil }
+        guard state == .active else { return nil }
+        if let startedUptime {
+            return ProcessInfo.processInfo.systemUptime - startedUptime
+        }
+        guard let startedAt else { return nil }
         return Date().timeIntervalSince(startedAt)
     }
 
@@ -205,6 +214,7 @@ public final class CallService {
         if var previous = callBeforeWaiting {
             if previous.state == .held { previous.state = .active }
             previous.startedAt = previous.startedAt ?? Date()
+            previous.startedUptime = previous.startedUptime ?? ProcessInfo.processInfo.systemUptime
             update(info: previous)
         } else {
             _ = try? refresh()
@@ -284,7 +294,13 @@ public final class CallService {
         }
         if first.state != .waiting { callBeforeWaiting = nil }
         var info = first
-        info.startedAt = (info.state == .active) ? (current.startedAt ?? Date()) : current.startedAt
+        if info.state == .active {
+            info.startedAt = current.startedAt ?? Date()
+            info.startedUptime = current.startedUptime ?? ProcessInfo.processInfo.systemUptime
+        } else {
+            info.startedAt = current.startedAt
+            info.startedUptime = current.startedUptime
+        }
         if info.number.isEmpty { info.number = current.number }
         update(info: info)
         return current
@@ -423,8 +439,14 @@ public final class CallService {
         info.state = state
         info.direction = direction
         info.number = number
-        if state == .active, info.startedAt == nil { info.startedAt = Date() }
-        if state == .idle || state == .ended { info.startedAt = nil }
+        if state == .active, info.startedUptime == nil {
+            info.startedUptime = ProcessInfo.processInfo.systemUptime
+            info.startedAt = info.startedAt ?? Date()
+        }
+        if state == .idle || state == .ended {
+            info.startedAt = nil
+            info.startedUptime = nil
+        }
         update(info: info)
     }
 

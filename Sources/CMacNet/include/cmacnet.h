@@ -72,4 +72,10 @@ void cmacnet_interface_ipv4(const char *bsdName, char *out, size_t outLen);
 /// no subprocess, no AT command, nothing that can go stale.
 int cmacnet_default_route_interface(char *out, size_t outLen);
 
+/// 通话静音的跨线程标志。音频实时回调里读、主线程写，必须是无锁原子；
+/// 用 C11 的 `_Atomic` 保证没有数据竞争（Swift 侧的普通 Bool 跨线程读写
+/// 在语言层面不是安全的）。
+void dj4g_set_muted(int muted);
+int dj4g_get_muted(void);
+
 #endif /* CMACNET_H */

@@ -235,9 +235,9 @@ enum RenderHarness {
             model.simulateRemoteHangup()
             pump(1.0)
 
-            // 按键音键盘：只在真正接通后才画得出来（空闲时它不出现在窗口里）。
-            // 来电 → 接听 → 这一张。键盘是三列四行，摆成这样还是那样，只有
-            // 图能回答。
+            // 按键音键盘：同一张电话键盘，通话中这一态画的是「按键音」那
+            // 张（带标题、按一位发一位）—— 和空闲态的拨号盘不一样。来电 →
+            // 接听 → 这一张。键盘是三列四行，摆成这样还是那样，只有图能回答。
             model.simulateIncomingCall()
             pump(0.8)
             model.answer()
@@ -253,7 +253,8 @@ enum RenderHarness {
                    "panel-ringing", width: Theme.panelWidth, to: directory)
             // 浮层卡片本来的样子。它是一块盖在全屏之上的窗口，截图里只有它
             // 自己，所以这张图是给交付说明用的：「来电时屏幕上会出现这个」。
-            render(RingCard(number: "+8613800138000", title: "来电响铃", answer: {}, reject: {}),
+            render(RingCard(number: "+8613800138000", title: "来电响铃", ringSilenced: false,
+                            answer: {}, reject: {}, silenceRinging: {}),
                    "ring-card", width: 304, to: directory)
         }
 
@@ -546,7 +547,7 @@ enum RenderHarness {
         model.refreshAll()
         pumpUntilIdle(model)
 
-        // 走真代码路径摆回出厂（「使用模式」那两颗按钮底下是同一条）：网卡写
+        // 走真代码路径摆回出厂（「使用场景」那两颗按钮底下是同一条）：网卡写
         // 0 = Windows 那一档，声卡那一位写 0。都不重启 —— 要的是那份组态，
         // 不是等一次重启。数据开关不碰：出厂这一档它本来就还没开。
         _ = try? model.controller.data.setUSBnetMode(.rndis, reboot: false)
@@ -1329,27 +1330,43 @@ enum RenderHarness {
         // 判据的五个输入每一个都能单独把它挡下来，下面六行就是那五条边界。
         check("服务被外面关掉、客人还开着 4G → 自己收回来",
               AppModel.shouldRestoreHostLink(dataWanted: true, linkWasUp: true, trouble: nil,
-                                             hasInterface: true, routeOnModule: false))
+                                             hasInterface: true, routeOnModule: false,
+                                             ipv4Empty: true))
         check("客人自己按了 4G OFF → 不许替他做主（他关得起也关得掉）",
               AppModel.shouldRestoreHostLink(dataWanted: false, linkWasUp: true, trouble: nil,
-                                             hasInterface: true, routeOnModule: false) == false)
+                                             hasInterface: true, routeOnModule: false,
+                                             ipv4Empty: true) == false)
         check("这条路根本没跑起来过 → 没有可收回的东西，不重排进程",
               AppModel.shouldRestoreHostLink(dataWanted: true, linkWasUp: false, trouble: nil,
-                                             hasInterface: true, routeOnModule: false) == false)
+                                             hasInterface: true, routeOnModule: false,
+                                             ipv4Empty: true) == false)
         check("模块这头出不了网 → 先等它好（开服务等于把整台 Mac 交给一条死链路）",
               AppModel.shouldRestoreHostLink(dataWanted: true, linkWasUp: true,
                                              trouble: "卡座里没有卡",
-                                             hasInterface: true, routeOnModule: false) == false)
+                                             hasInterface: true, routeOnModule: false,
+                                             ipv4Empty: true) == false)
         check("网卡还没被 macOS 发布出来 → 等下一拍",
               AppModel.shouldRestoreHostLink(dataWanted: true, linkWasUp: true, trouble: nil,
-                                             hasInterface: false, routeOnModule: false) == false)
+                                             hasInterface: false, routeOnModule: false,
+                                             ipv4Empty: true) == false)
         // 同一个现场，只把「默认路由压在哪儿」换一下。这就是那三十秒里唯一真的
         // 变过的东西：服务被关掉、路由回到 Wi-Fi，而 `data.serviceEnabled` 那个
         // 缓存还写着「开着」—— 第一版的判据就是拿它当答案，于是整段瞎了。判据
         // 必须问路由表，这一行钉的就是这件事。
         check("判据问的是路由表，不是那个会过期的服务状态（路由还在模块上就什么都不做）",
               AppModel.shouldRestoreHostLink(dataWanted: true, linkWasUp: true, trouble: nil,
-                                             hasInterface: true, routeOnModule: true) == false)
+                                             hasInterface: true, routeOnModule: true,
+                                             ipv4Empty: true) == false)
+        // 第十二轮：默认路由短暂漂到 Wi-Fi、但网卡 IP 还在 —— 这不是服务被关，
+        // 是路由的瞬时变化。重新启停服务只会造出「被关掉→开回来」的假故障。
+        check("路由漂到 Wi-Fi 但 IP 还在 → 不是服务被关，不自愈（第十二轮）",
+              AppModel.shouldRestoreHostLink(dataWanted: true, linkWasUp: true, trouble: nil,
+                                             hasInterface: true, routeOnModule: false,
+                                             ipv4Empty: false) == false)
+        check("路由漂走且 IP 也没了 → 服务真被关，自愈（第十二轮）",
+              AppModel.shouldRestoreHostLink(dataWanted: true, linkWasUp: true, trouble: nil,
+                                             hasInterface: true, routeOnModule: false,
+                                             ipv4Empty: true))
 
         // 第四类故障：模块枚举好了，**系统那一半没做完**。2026-09-27 真机复现
         // 三次 —— 屏幕锁着的时候插上模块，`configd` 明确拒绝给它命名，而且解锁
@@ -1651,7 +1668,15 @@ enum RenderHarness {
         }
 
         capture("掉线", model)
+        // 在线 = 模块连着 + 数据开。模拟器默认 dataWanted 是关，先把它按到开，
+        // 否则「在线」也会被画成灰色，和「数据关」分不开。
+        pressDataSwitch(labelModel, true)
         capture("在线", labelModel)
+        // 数据开关关掉：内容还是信号条 + 4G，只是整枚变灰。必须抢在通话状态
+        // 之前抓，因为来电 / 等待那两档不跟着灰。
+        pressDataSwitch(labelModel, false)
+        capture("数据关", labelModel)
+        pressDataSwitch(labelModel, true)
         labelModel.simulateIncomingCall()
         waitUntil(labelModel) { $0.call.state == .ringing }
         capture("来电响铃", labelModel)
@@ -1662,7 +1687,7 @@ enum RenderHarness {
         capture("等待接听", labelModel)
 
         let bodyTypes = labelStates.map(\.body)
-        check("四种状态下菜单栏标签是同一个视图类型（\(Set(bodyTypes).count) 种：\(bodyTypes[0])）",
+        check("五种状态下菜单栏标签是同一个视图类型（\(Set(bodyTypes).count) 种：\(bodyTypes[0])）",
               Set(bodyTypes).count == 1)
         check("菜单栏标签是一个 Image，不是分支也不是组合（\(bodyTypes[0])）",
               bodyTypes[0].contains("Image")
@@ -1671,8 +1696,21 @@ enum RenderHarness {
         // 结构不变不等于画什么都不变：来电必须看得出来，否则「有提示」和
         // 「没提示」在客户眼里是同一件事。号码那一版一定比「4G」宽。
         check("来电那一版比在线那一版宽，说明内容真的换了（"
-              + "\(Int(labelStates[1].image.size.width)) → \(Int(labelStates[2].image.size.width))）",
-              labelStates[2].image.size.width > labelStates[1].image.size.width)
+              + "\(Int(labelStates[1].image.size.width)) → \(Int(labelStates[3].image.size.width))）",
+              labelStates[3].image.size.width > labelStates[1].image.size.width)
+
+        // 数据关的判据（纯函数）+ 实际画出来的 alpha 变淡。
+        check("数据关、非通话 → 图标该灰",
+              MenuBarLabel.shouldDim(dataWanted: false, callAlerting: false))
+        check("数据开 → 图标不灰",
+              !MenuBarLabel.shouldDim(dataWanted: true, callAlerting: false))
+        check("来电时即使数据关也不灰",
+              !MenuBarLabel.shouldDim(dataWanted: false, callAlerting: true))
+        let onlinePeak = peakAlpha(labelStates[1].image)
+        let dataOffPeak = peakAlpha(labelStates[2].image)
+        check("数据关时图标真的变淡（峰值 alpha \(String(format: "%.2f", onlinePeak)) → "
+              + "\(String(format: "%.2f", dataOffPeak))）",
+              onlinePeak > 0.8 && dataOffPeak > 0.2 && dataOffPeak < onlinePeak - 0.2)
 
         for state in labelStates {
             check("\(state.name)时菜单栏标签高度还是 \(Int(MenuBarLabel.labelHeight))"
@@ -1683,8 +1721,11 @@ enum RenderHarness {
             // 光有尺寸不够：`MenuBarExtra` 的标签只合成 `Text` 和 `Image`，
             // SwiftUI 自己画的东西会被整块丢掉 —— 那样图标还在、位置还占，
             // 只是空的。所以这里数一遍真的落了墨的像素。
-            check("\(state.name)时菜单栏标签真的画出了东西（\(ink(state.image)) 个像素）",
-                  ink(state.image) > 0)
+            // 数据关那一档整枚压到 0.4 的灰，`ink` 按 0.5 数会得 0 —— 但它
+            // 确实画了，只是更淡，所以给它一个更低的门槛。
+            let painted = ink(state.image, threshold: state.name == "数据关" ? 0.2 : 0.5)
+            check("\(state.name)时菜单栏标签真的画出了东西（\(painted) 个像素）",
+                  painted > 0)
         }
 
         // 面板窗口那条后路。这里钉得住的是「信号」那一半：客户双击第二下时，
@@ -1884,7 +1925,8 @@ enum RenderHarness {
             // 尺寸是卡片按这通电话的号码现算出来的，所以它顺带证明了窗口里装
             // 的是这通来电，而不是上一通留下的东西。
             let host = NSHostingView(rootView: RingCard(
-                number: model.call.number, title: "来电响铃", answer: {}, reject: {}))
+                number: model.call.number, title: "来电响铃", ringSilenced: false,
+                answer: {}, reject: {}, silenceRinging: {}))
             host.layout()
             let expected = host.fittingSize
             check("窗口尺寸就是这通电话的卡片（期望 \(Int(expected.width))×\(Int(expected.height))，实际 \(Int(card.frame.width))×\(Int(card.frame.height))）",
@@ -2597,17 +2639,31 @@ enum RenderHarness {
     /// `MenuBarExtra` only composites `Text` and `Image`, so anything the label
     /// draws for itself is dropped whole. Counting painted pixels is the only
     /// way to tell that apart from a label that simply has a dark background.
-    private static func ink(_ image: NSImage) -> Int {
+    private static func ink(_ image: NSImage, threshold: CGFloat = 0.5) -> Int {
         guard let data = image.tiffRepresentation,
               let representation = NSBitmapImageRep(data: data) else { return -1 }
         var painted = 0
         for y in 0..<representation.pixelsHigh {
             for x in 0..<representation.pixelsWide
-            where (representation.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.5 {
+            where (representation.colorAt(x: x, y: y)?.alphaComponent ?? 0) > threshold {
                 painted += 1
             }
         }
         return painted
+    }
+
+    /// 图里最不透明的那一个像素的 alpha（0…1）。菜单栏标签是模板图，alpha
+    /// 就是「看得见多少」：全彩是 1，变灰那档是 0.4。拿来钉「数据关变灰」。
+    private static func peakAlpha(_ image: NSImage) -> CGFloat {
+        guard let data = image.tiffRepresentation,
+              let representation = NSBitmapImageRep(data: data) else { return -1 }
+        var peak: CGFloat = 0
+        for y in 0..<representation.pixelsHigh {
+            for x in 0..<representation.pixelsWide {
+                peak = max(peak, representation.colorAt(x: x, y: y)?.alphaComponent ?? 0)
+            }
+        }
+        return peak
     }
 
     private static func waitUntil(_ model: AppModel, timeout: TimeInterval = 25,

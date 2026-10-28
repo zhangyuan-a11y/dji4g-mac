@@ -1,0 +1,63 @@
+第三方组件许可说明（随包分发）
+================================
+
+本目录（ModuleVoice/）是「通话语音」功能随包携带的模块侧组件。
+各组件来源与许可如下，按分发合规要求逐项列出。
+
+------------------------------------------------------------------
+1. adb
+------------------------------------------------------------------
+   · 来源：Android SDK Platform-Tools（原样复制，未修改）
+   · 版本：37.0.1-15733141
+   · 许可：Apache License 2.0（全文见同目录 adb-NOTICE.txt）
+   · 说明：见同目录 adb-来源.txt
+   · 合规状态：已附许可全文与来源说明。
+
+------------------------------------------------------------------
+2. qdc507_voice.ko / qdc507_aprv3.ko（GPL-2.0 内核模块）
+------------------------------------------------------------------
+   · 性质：Linux 内核模块（内核 3.18.44，ARMv7），模块内 license 字段
+     （strings 可见：license=GPL v2）。
+   · 来源：衍生自 the-modem-distro/quectel_eg25_kernel，固定提交
+     commit 82ed00908b3e8efc3ff0de27d2b5a7c0524ecd7f
+     https://github.com/the-modem-distro/quectel_eg25_kernel
+   · 构建说明：见同目录 MODULE-REPORT.md（QDC507 可加载 APRv3 +
+     minimal AFE 音频栈构建报告，含源码提交、工具链、Module.symvers
+     与产物审计）。
+   · 许可：GPL-2.0（全文见同目录 COPYING-GPL-2.0）。
+   · 源码要约：接收方可向分发方索取与上述固定提交对应的完整对应
+     源码（quectel_eg25_kernel @ 82ed0090… 及本构建所用补丁/打包
+     脚本），或直接从上述 GitHub 提交取得上游源码。
+   · 合规状态：许可文本 + 构建报告已随包附上；源码义务通过公开
+     固定提交 + 书面要约闭合。
+
+------------------------------------------------------------------
+3. mavo-pcm-bridge.armv7（MIT，已确认）
+------------------------------------------------------------------
+   · 性质：模块侧用户态辅助程序（ARM EABI5，stripped）。
+   · 用途：通话期间维护 Voice Call 的 PCM 路由会话（--voice-route-session）。
+   · 来源：moluncn/mavo（MIT License，Copyright (c) 2026 MaVo contributors）
+     https://github.com/moluncn/mavo
+     对应源码：module/mavo_pcm_bridge.c
+     可复现构建：scripts/build_pcm_bridge_armel.sh
+   · 独立编写声明：该用户态 PCM 桥由 MaVo 项目独立编写（非 GPL 派生），
+     见 MaVo 项目 THIRD_PARTY_NOTICES.md：
+     "The macOS application and its user-space PCM bridge were written
+      independently."
+   · SHA-256 一致性核验（本包内文件 == moluncn/mavo 发布文件）：
+     mavo-pcm-bridge.armv7
+       88d47c15e61d1428a59c821fed804c2e6490e82859a085062f21966b58d167fc
+     qdc507_aprv3.ko
+       3d82d3dec4f1e323201bba87156df9d41438e08314097353f2607f9117211d4a
+     qdc507_voice.ko
+       ed3821682d5309969a01c764192c83feff9669c61ef237c69475cd1619cf296c
+     （三个文件与本目录实际文件逐一完全一致。）
+   · 许可：MIT（全文见 moluncn/mavo 仓库 LICENSE）。
+   · 合规状态：来源、版权、许可证与源码位置均已确认，可随包分发。
+
+------------------------------------------------------------------
+分发方义务小结
+------------------------------------------------------------------
+以上信息随包提供给接收方。组件 1（Apache 2.0）、组件 3（MIT）许可
+文本与来源均已闭合；组件 2（GPL-2.0）以「附许可全文 + 附构建报告 +
+公开固定提交 + 书面源码要约」方式满足 GPL-2.0 分发义务。

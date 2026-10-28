@@ -37,6 +37,9 @@ final class RingAlert {
     /// 卡片上此刻画着的标题。轮询每两秒重发一次同样的来电状态，比对一下就不会
     /// 每两秒重建一次窗口 —— 重建会把客户正要点的那颗按钮从光标下面挪走。
     private var cardKey = ""
+    /// 这一通来电的铃声是不是被用户手动静音了。只对这一通有效，下一通独立
+    /// 来电会重新按正常行为响铃。
+    private var ringSilenced = false
     private(set) var isShowing = false
 
     private init() {}
@@ -70,8 +73,15 @@ final class RingAlert {
         guard isShowing || panel != nil else { return }
         isShowing = false
         cardKey = ""
+        ringSilenced = false
         stopRinging()
         panel?.orderOut(nil)
+    }
+
+    /// 只关掉这一通的铃声，不拒接、不清掉卡片；接听/拒接按钮照旧可用。
+    func silenceRingtone() {
+        ringSilenced = true
+        stopRinging()
     }
 
     // MARK: - Window
@@ -86,8 +96,10 @@ final class RingAlert {
         let host = NSHostingView(rootView: RingCard(
             number: call.number.isEmpty ? "未知号码" : call.number,
             title: title,
+            ringSilenced: ringSilenced,
             answer: answer,
-            reject: reject))
+            reject: reject,
+            silenceRinging: { [weak self] in self?.silenceRingtone() }))
         host.layout()
         let panel = self.panel ?? makePanel()
         panel.setContentSize(host.fittingSize)
@@ -167,8 +179,23 @@ private final class RingPanel: NSPanel {
 struct RingCard: View {
     var number: String
     var title: String
+    var ringSilenced: Bool
     var answer: () -> Void
     var reject: () -> Void
+    var silenceRinging: () -> Void
+    @State private var silenced = false
+
+    init(number: String, title: String, ringSilenced: Bool,
+         answer: @escaping () -> Void, reject: @escaping () -> Void,
+         silenceRinging: @escaping () -> Void) {
+        self.number = number
+        self.title = title
+        self.ringSilenced = ringSilenced
+        self.answer = answer
+        self.reject = reject
+        self.silenceRinging = silenceRinging
+        _silenced = State(initialValue: ringSilenced)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -193,6 +220,13 @@ struct RingCard: View {
                 CardButton(title: "拒接", glyph: "phone.down.fill",
                            tint: Theme.alert, action: reject)
             }
+            CardButton(title: silenced ? "已静音" : "静音铃声",
+                       glyph: silenced ? "bell.slash.fill" : "bell.slash",
+                       tint: Theme.ink,
+                       action: {
+                           silenced = true
+                           silenceRinging()
+                       })
         }
         .padding(14)
         .frame(width: 288)

@@ -125,45 +125,10 @@ struct NetworkDetail: View {
                       tint: model.data.serviceEnabled
                           ? Theme.phosphorInk
                           : (model.data.hasInterface ? Theme.alertInk : Theme.inkNote))
-                Spacer()
-                if model.data.hasInterface {
-                    // 「开关」这个词说的是一个**东西**，不是一个动作：客户读到
-                    // 它不知道按下去会发生什么；它又被 `Spacer()` 推到整行最右，
-                    // 和左边的「Baiwang 已启用」隔着一整个面板宽 —— 2026-09-26
-                    // 放大截图里，它就是一行没人管的灰字，紧贴在底部图标条上面。
-                    //
-                    // 改成写出动作的胶囊按钮：亮着的时候按下去是「停用」，熄着的
-                    // 时候按下去是「启用」，按之前就知道结果。它自己也有边框和面，
-                    // 和上面那排 刷新 / 数据开 / 自动联网 是同一族的白色塑料件，客户
-                    // 一眼认得出这是能点的东西。
-                    Button {
-                        model.setHostService(!model.data.serviceEnabled)
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: model.data.serviceEnabled
-                                  ? "pause.circle" : "play.circle")
-                                .font(.system(size: 9.5, weight: .semibold))
-                            Text(model.isWorking ? "处理中"
-                                 : (model.data.serviceEnabled ? "停用" : "启用")).label(9)
-                        }
-                        .foregroundStyle(Theme.ink)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(
-                            Capsule()
-                                .fill(Theme.chromeHi)
-                                .overlay(Capsule().strokeBorder(Theme.chromeEdgeStrong,
-                                                                lineWidth: 1))
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    // 跑在 `run(…)` 里，中途 `isWorking` 会亮；那一秒里再按一次
-                    // 只会被拒，所以直接锁上。
-                    .disabled(model.isWorking)
-                    .help(model.data.serviceEnabled
-                          ? "停用 macOS 里这条网络服务，默认路由回到 Wi-Fi"
-                          : "启用 macOS 里这条网络服务，流量改走模块")
-                }
+                // 2026-10-26 方案 A：这里原本有一个「启用/停用 Baiwang」的胶囊
+                // 按钮，和网络页的「数据」开关单向后联动（数据关会停服务，服务关
+                // 数据却不关），客户看到两个开关会困惑。现在只保留只读状态，开关
+                // 收敛到「数据」一个入口。
             }
         }
     }

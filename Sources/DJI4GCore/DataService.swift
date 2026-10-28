@@ -52,6 +52,37 @@ public enum DataCounterSource: String, Equatable {
     case module
 }
 
+/// 网络数据链路的单一路状态机。
+///
+/// 从「模块插上」到「真的通过 4G 出网」排成一条直线，任何一格没到，后面
+/// 的「成功」都只是模块这头的一种说法，不构成「能上网」。面板和诊断都该
+/// 以它为准，而不是各自拼一堆布尔量。
+public enum NetworkLinkState: String, Equatable, CaseIterable {
+    case disconnected        // 模块没插 / AT 没通
+    case usbDetected         // USB 枚举到了，AT 还没就绪
+    case atReady             // AT 通道可用，SIM 还没就绪
+    case simReady            // SIM 就绪，蜂窝还没注册
+    case networkRegistered   // 注册成功，数据会话还没起来
+    case dataSessionReady    // PDP 起来了，ECM 网卡还没出现
+    case ecmReady            // 网卡在，还没拿到 IP
+    case ipReady             // 拿到 IP，实测还没验证出网
+    case internetVerified    // 实际通过 4G 接口访问互联网成功
+
+    public var label: String {
+        switch self {
+        case .disconnected: return "未连接"
+        case .usbDetected: return "已识别 USB"
+        case .atReady: return "AT 就绪"
+        case .simReady: return "SIM 就绪"
+        case .networkRegistered: return "已注册网络"
+        case .dataSessionReady: return "数据会话就绪"
+        case .ecmReady: return "ECM 就绪"
+        case .ipReady: return "已获取 IP"
+        case .internetVerified: return "互联网已验证"
+        }
+    }
+}
+
 public struct DataStatus: Equatable {
     public var usbnetMode: USBnetMode?
     public var composition: USBComposition?
@@ -62,6 +93,13 @@ public struct DataStatus: Equatable {
     public var apn: String = ""
     public var pdpActive: Bool = false
     public var counterSource: DataCounterSource = .host
+    /// 当前 `bytesIn / bytesOut` 是否来自一个**已确认的 4G 流量来源**：
+    /// 要么是 `verifiedModuleInterface()` 命中的 QDC507 ECM 网卡计数器，
+    /// 要么是模块自己在 AT 口上报的 `AT+QGDCNT?` 计数（`counterSource == .module`）。
+    ///
+    /// 只有它为真，面板才允许把读数当成 4G 流量累计或显示成「本月」。
+    /// Wi-Fi、VPN、Thunderbolt 或其他 USB 网卡命中的读数永远到不了这里。
+    public var countersVerified: Bool = false
     /// Name of the macOS network service bound to `interfaceName`, e.g.
     /// "Baiwang". Empty before macOS finishes creating it.
     public var serviceName: String = ""
@@ -83,6 +121,24 @@ public struct DataStatus: Equatable {
     public var isConnected: Bool { !ipv4Address.isEmpty }
 
     public var hasInterface: Bool { !interfaceName.isEmpty }
+
+    /// 现在这条链路走到了哪一格。`internetVerified` 由实测结果喂进来
+    /// （`NetProbe`），DataStatus 自己不探测，所以保持纯函数、可测。
+    public func linkState(usbPresent: Bool,
+                          atReady: Bool,
+                          simReady: Bool,
+                          registered: Bool,
+                          internetVerified: Bool) -> NetworkLinkState {
+        if !usbPresent { return .disconnected }
+        if !atReady { return .usbDetected }
+        if !simReady { return .atReady }
+        if !registered { return .simReady }
+        if !pdpActive { return .networkRegistered }
+        if !hasInterface { return .dataSessionReady }
+        if !isConnected { return .ecmReady }
+        if !internetVerified { return .ipReady }
+        return .internetVerified
+    }
 
     /// Traffic can actually leave the machine over the module. macOS keeps the
     /// network service disabled until asked, so a link can be fully up and
@@ -217,12 +273,20 @@ public final class DataService {
         defer { statusLock.unlock() }
         guard !pinnedHostState else { return status }
 
-        let name = hostInterfaceName()
+        let name = verifiedModuleInterface()
         guard !name.isEmpty else {
             // 早返回之前先问一句「网卡是不是挂着没有名字」。客人插着模块却一直
             // 没网的时候面板多半是关着的，这条两秒一次的巡检是唯一还在走的路 ——
             // 把这一问放到早返回后面，等于这个状态永远没人看见。
             status.interfaceStranded = hostInterfaceStranded()
+            // 没有已验证的模块 ECM 网卡：当前读数不能再当成 4G 流量。
+            // 不动 bytesIn/Out，是为了在完整刷新（`refreshStatus`）把「模块计数」
+            // 这一路接上之前，不让详情页的读数闪空；但来源标记必须撤销。
+            // 只撤销「主机 ECM 网卡」这一路的标记；「模块计数」路由完整刷新负责，
+            // 这条无 AT 的高频路径看不见它，不能顺手把它抹掉。
+            if status.counterSource == .host {
+                status.countersVerified = false
+            }
             return status
         }
         status.interfaceStranded = false
@@ -236,6 +300,7 @@ public final class DataService {
         status.interfaceName = name
         status.ipv4Address = String(cString: address)
         status.counterSource = .host
+        status.countersVerified = true
         if counted {
             status.bytesIn = bytesIn
             status.bytesOut = bytesOut
@@ -329,14 +394,9 @@ public final class DataService {
         return ok
     }
 
-    public func deactivatePDP(context: Int = 1) throws {
-        _ = try session.send("AT+QIDEACT=\(context)", timeout: 25)
-        status.pdpActive = false
-    }
-
     /// `AT+QIACT?`：模块自己认为哪些 PDP 上下文是活的。
     ///
-    /// 这个位不能只由 `activatePDP()` / `deactivatePDP()` 来写。模块注册上
+    /// 这个位不能只由 `activatePDP()` 来写。模块注册上
     /// 网络之后会**自己**把上下文 1 拉起来 —— 客户一个按钮都没按过，网就在
     /// 跑了。只记「我按过的那一下」，面板和只读体检页就会写着「PDP 未激活」，
     /// 而模块那边 `AT+QIACT?` 明明回 `+QIACT: 1,1,1,"100.69.150.192"`。
@@ -354,6 +414,23 @@ public final class DataService {
             if fields.count >= 2, fields[1] == "1" { return true }
         }
         return false
+    }
+
+    /// `AT+CGPADDR`：模块给每个 PDP 上下文实际分配的 IP。
+    ///
+    /// `AT+QIACT?` 里那个 IP 是「模块认为」的值；`AT+CGPADDR` 是 3GPP 标准的
+    /// 查法，两条都能读，但诊断里把两条都带上，好互相印证。返回空串表示
+    /// 读不到（命令不支持、上下文没激活、或模块没回）。
+    public func readPDPAddress(context: Int = 1) throws -> String {
+        let response = try session.send("AT+CGPADDR=\(context)", timeout: 5)
+        for row in response.values(for: "+CGPADDR") {
+            let fields = row.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            // 形状：<cid>,<PDP_addr>，PDP_addr 可能是带引号的 IP 或 0.0.0.0。
+            guard fields.count >= 2 else { continue }
+            let address = fields[1].trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            if !address.isEmpty, address != "0.0.0.0" { return address }
+        }
+        return ""
     }
 
     /// `AT+QGDCNT?` returns byte counters kept by the module itself; useful when
@@ -378,16 +455,35 @@ public final class DataService {
     /// BSD name of the ECM interface belonging to the module, if macOS has
     /// already attached a driver to it.
     public func hostInterfaceName() -> String {
+        // 网卡身份一律走严格门禁：不是「看起来像 enXX」就算数，必须同时满足
+        // USB 身份匹配 + 当前实际枚举 + 组态带网络功能 + macOS 已建 ECM 网卡。
+        return verifiedModuleInterface()
+    }
+
+    /// 流量计数的严格门禁：只有同时满足下面三条，才返回这块网卡的 BSD 名。
+    ///
+    /// 1. 此刻总线上真的枚举到一块受支持的模块（`USBModuleIdentity.attached()`，
+    ///    是实时 IOKit 扫描，不是历史缓存）；
+    /// 2. 那块模块的 USB 组态里带网络功能（ECM 数据接口）；
+    /// 3. macOS 已经为这个 USB 设备创建了以太网卡（`cmacnet_usb_ethernet`
+    ///    沿着 IORegistry 的父链反查到同一个 idVendor/idProduct）。
+    ///
+    /// Wi-Fi（en0）、VPN（utun*）、Thunderbolt 网桥（bridge*）、别家厂商的
+    /// USB 网卡都满足不了这三条，因此永远进不了流量统计。
+    public func verifiedModuleInterface() -> String {
         for candidate in USBModuleIdentity.attached() {
+            guard let inventory = USBInventory.read(candidate),
+                  inventory.hasNetworkFunction else {
+                continue
+            }
             var buffer = [CChar](repeating: 0, count: 64)
-            if cmacnet_usb_ethernet(UInt16(candidate.vendorID), UInt16(candidate.productID),
+            if cmacnet_usb_ethernet(UInt16(candidate.vendorID),
+                                    UInt16(candidate.productID),
                                     &buffer, buffer.count) == 1 {
                 return String(cString: buffer)
             }
         }
-        // A module re-flashed with stock Quectel firmware presents the Quectel
-        // identity, which `attached()` already covers, so reaching here means
-        // the composition carries no ECM function at all.
+        // 到这里要么没有模块，要么组态不带 ECM 网络功能，要么 macOS 还没建网卡。
         return ""
     }
 
@@ -438,11 +534,12 @@ public final class DataService {
         // 上面会把「用户按了 4G OFF」的夹具冲成「已开启」，截图和真机对不上。
         fresh.pdpActive = (try? readPDPActive()) ?? fresh.pdpActive
 
-        let name = hostInterfaceName()
+        let name = verifiedModuleInterface()
         fresh.interfaceName = name
         if !name.isEmpty {
             fresh.interfaceStranded = false
             fresh.counterSource = .host
+            fresh.countersVerified = true
             var address = [CChar](repeating: 0, count: 64)
             cmacnet_interface_ipv4(name, &address, address.count)
             fresh.ipv4Address = String(cString: address)
@@ -470,10 +567,13 @@ public final class DataService {
                 fresh.bytesIn = counters.received
                 fresh.bytesOut = counters.sent
                 fresh.counterSource = .module
+                // 模块在 AT 口上报的计数天然绑着这块模块，属于已验证来源。
+                fresh.countersVerified = true
             } else {
                 fresh.bytesIn = 0
                 fresh.bytesOut = 0
                 fresh.counterSource = .host
+                fresh.countersVerified = false
             }
         }
         // The stated totals win over anything measured here, including a real
@@ -538,7 +638,7 @@ public final class DataService {
         statusLock.lock()
         let device = status.interfaceName
         statusLock.unlock()
-        guard !device.isEmpty else { throw DataError.noInterface("还没有网卡，先在设置里把「使用模式」切到 Mac 版") }
+        guard !device.isEmpty else { throw DataError.noInterface("还没有网卡，先在设置里把「使用场景」切到 Mac 版") }
         // The pinned interface does not exist on this Mac, so there is no real
         // service to switch. Only the stated value moves — which also keeps a
         // simulated run from ever reaching `networksetup`.

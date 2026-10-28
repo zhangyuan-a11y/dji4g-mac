@@ -463,6 +463,10 @@ public final class SimulatedATTransport: ATTransport {
             }
         case upper.hasPrefix("AT+QIACT"):
             trimmed.uppercased().hasSuffix("?") ? emit("\r\n+QIACT: 1,1,1,\"10.31.1.42\"\r\n\r\nOK\r\n") : ok()
+        case upper.hasPrefix("AT+CGPADDR"):
+            // 模拟 NAT 场景：蜂窝侧 IP（100.69.150.192）与主机 ECM DHCP 拿到的
+            // 地址（10.31.1.42）不同 —— 两者不一致不是故障。
+            emit("\r\n+CGPADDR: 1,\"100.69.150.192\"\r\n\r\nOK\r\n")
         case upper.hasPrefix("AT+QIDEACT"):
             ok()
         case upper.hasPrefix("AT+QGDCNT"):

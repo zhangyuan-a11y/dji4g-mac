@@ -383,10 +383,10 @@ struct MainScreen: View {
         Screen(radius: 16) {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text(model.quotaGB > 0 ? "DATA LEFT" : "SIGNAL").label(9)
+                    Text(model.remainingGB != nil ? "DATA LEFT" : "SIGNAL").label(9)
                         .foregroundStyle(Theme.phosphorDim)
                     Spacer()
-                    Text(model.quotaGB > 0 ? "实时估算" : model.network.band)
+                    Text(model.remainingGB != nil ? "实时估算" : model.network.band)
                         .label(9)
                         .foregroundStyle(Theme.phosphorDim)
                 }
@@ -408,8 +408,8 @@ struct MainScreen: View {
                     }
                 }
                 HStack(spacing: 12) {
-                    Text("今日 \(format(model.todayBytes))").label(9)
-                    Text("\(model.data.counterSource == .module ? "模块计数" : "本月") \(format(model.monthBytes))").label(9)
+                    Text(todayText).label(9)
+                    Text(monthText).label(9)
                     Spacer()
                     Text(model.data.ipv4Address.isEmpty ? "无 IPv4" : model.data.ipv4Address).label(9)
                 }
@@ -428,11 +428,33 @@ struct MainScreen: View {
     }
 
     private var subhead: String {
-        if model.quotaGB > 0 {
+        if model.remainingGB != nil {
             let percent = Int((model.remainingFraction * 100).rounded())
             return String(format: "%d%% LEFT", percent)
         }
         return model.stateLine
+    }
+
+    /// 底部「今日」那一格。没有已验证数据时写「—」，不虚构 0。
+    private var todayText: String {
+        switch model.trafficDisplay {
+        case .live, .historical: return "今日 \(format(model.todayBytes))"
+        case .noData, .unavailable: return "今日 —"
+        }
+    }
+
+    /// 底部「本月」那一格，四种状态各说各的话。
+    private var monthText: String {
+        switch model.trafficDisplay {
+        case .live:
+            return "本月 \(format(model.monthBytes))"
+        case .historical:
+            return "已记录的4G流量 \(format(model.monthBytes))"
+        case .noData:
+            return "本月 暂无数据"
+        case .unavailable:
+            return "本月 暂无法统计"
+        }
     }
 
     /// 单位写成两个字母（`GB` 而不是 `G`）。

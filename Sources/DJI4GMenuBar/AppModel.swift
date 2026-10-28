@@ -75,6 +75,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var callVoiceLive = false
     /// 通话中的实时电平：`up` 是麦克风送进模块的音量，`down` 是对方的声音。
     @Published private(set) var callLevels = CallAudioBridge.Levels()
+    /// 上行静音状态。与 `callBridge.isMuted` 同步，UI 据此显示静音按钮。
+    @Published private(set) var callMuted = false
     /// 麦克风没授权。
     ///
     /// 2026-09-30 那通「接通 33 秒才出声」的电话，根因就是这个开关没打开
@@ -147,8 +149,16 @@ final class AppModel: ObservableObject {
     /// actor-isolated 的；起停都走 `callAudioQueue` 这一条串行队列，
     /// 「接通」和「挂断」不会互相插队。
     nonisolated let callBridge = CallAudioBridge()
-    /// 一键安装「通话语音」那条通路（解锁 ADB → 驱动 → 校准 → PCM 桥）。只读的
-    /// `inspect()` 不动模块，随时可以调。
+
+    /// 切换通话静音（只静音上行麦克风，不挂断、不影响系统其他应用）。
+    func toggleCallMute() {
+        let next = !callMuted
+        callBridge.setMuted(next)
+        callMuted = next
+        AppLog.log(next ? "通话已静音（上行）" : "通话已取消静音（上行）")
+    }
+    /// 「通话语音」那条通路的自动装配（解锁 ADB → 驱动 → 校准 → PCM 桥）。
+    /// 只读的 `inspect()` 不动模块，随时可以调。
     nonisolated let voiceProvision: ModuleVoiceSetup
 
     /// 模块正在重启 / 重新枚举的窗口。
@@ -202,8 +212,8 @@ final class AppModel: ObservableObject {
     /// drawing the real window.
     let isInteractiveSim: Bool
     private static let quotaKey = "DJI4G.quotaGB"
-    private static let hostModeKey = "DJI4G.hostMode"
     private static let autoAPNKey = "DJI4G.autoApplyAPN"
+    private static let hostModeKey = "DJI4G.hostMode"
     /// 「模块里现在这个 APN 是给哪张卡写的」。记 ICCID。
     ///
     /// 2026-09-26 加：模块里只要**有** APN，自动配 APN 那条路从此就一个字都不
@@ -230,8 +240,19 @@ final class AppModel: ObservableObject {
     private static let dayTotalKey = "DJI4G.dayTotal"
     private static let monthKeyKey = "DJI4G.monthKey"
     private static let monthTotalKey = "DJI4G.monthTotal"
+    /// 本月累计是否至少有一拍来自「已确认的 QDC507 网卡」。没有这个标记的
+    /// 历史数值（旧版本可能把网卡生命周期总计数器当成本月用量）一律按
+    /// 「未验证」处理，不显示为真实 4G 月流量。
+    static let monthVerifiedKey = "DJI4G.monthVerified"
+    /// 一次性迁移标记：把旧的无来源累计值挪到备份键后只做一次，可回退。
+    static let provenanceMigratedKey = "DJI4G.provenanceMigrated"
+    static let monthUnverifiedBackupKey = "DJI4G.monthTotal.unverifiedBackup"
+    static let dayUnverifiedBackupKey = "DJI4G.dayTotal.unverifiedBackup"
     /// 接口计数器上一次的读数。有它才分得清「计数器归零了」和「真的没走流量」。
     private static let lastTotalKey = "DJI4G.lastTotal"
+    /// 上一次读数来自哪块网卡。网卡名变了说明模块重新枚举，要重新建基线，
+    /// 不能拿新网卡的生命周期计数器减去旧网卡的读数。
+    private static let lastTotalInterfaceKey = "DJI4G.lastTotalInterface"
     /// How long a 「来电」 announcement waits for `+CLIP` before it settles for
     /// 「未知号码」. Long enough to cover the number arriving on the next poll,
     /// short enough that nobody notices the notification is a beat late.
@@ -441,6 +462,13 @@ final class AppModel: ObservableObject {
     private(set) var announcesAlerts = true
     /// 「本月」的累加值。真机路径上是它，不是接口计数器（见 `monthBytes`）。
     private var monthAccumulated: UInt64 = 0
+    /// 本月累计是否至少有一拍来自「已确认的 QDC507 网卡 / 模块计数」。
+    ///
+    /// 为假时，盘上的历史数值一律按「未验证」处理，不显示为真实 4G 月流量。
+    /// 由 `sampleTraffic` 在拿到第一拍已验证增量时置真，跨月时清回假。
+    @Published private(set) var monthVerified = false
+    /// 纯增量累计器：基线、跨月跨天、回退重建都在这里，见 `TrafficAccounting`。
+    private var trafficAccounting = TrafficAccounting()
     /// 上一拍是不是还在后台读计数。两秒一拍，读一次要几十毫秒；上一次没回来
     /// 就跳过这一拍，不排队。队列排起来只会让数字越算越晚，不会让它们更准。
     private var isRefreshingCounters = false
@@ -529,6 +557,7 @@ final class AppModel: ObservableObject {
         simulator = nil
         quotaGB = stored > 0 ? stored : 0
         autoApplyAPN = UserDefaults.standard.object(forKey: AppModel.autoAPNKey) as? Bool ?? true
+        // 读回客户上次选的那一档：Mac 版（打电话）或移动版（插手机/平板上网）。
         hostModeChoice = HostMode(rawValue: UserDefaults.standard
             .string(forKey: AppModel.hostModeKey) ?? "") ?? .mac
         startAtLogin = LoginItem.status().installed
@@ -792,6 +821,11 @@ final class AppModel: ObservableObject {
     /// 插上模块就得再按一次。那个方向的关，只有客人自己按、或者 `guardDataRoute`
     /// 判断这条链路真出不了网时才写。
     private func syncDataWanted(_ fresh: DataStatus) {
+        // 客人已经亲手拨过开关：位置从此由客人说了算，链路事实不许再翻回去。
+        // ③ 的根因修复：关数据那一下若 PDP 没真去活（个别固件 `QIDEACT` 回
+        // ERROR），`pdpActive` 会一直报活；没有这道闸，settle 窗一过这里就把
+        // dataWanted 翻回 true、又把服务开回来。
+        guard !dataSwitchTouched else { return }
         // 客人刚刚亲手拨过：这两三秒里系统还在落地，等下一拍再说。
         if let at = dataSwitchTouchedAt, Date().timeIntervalSince(at) < Self.switchSettleSeconds { return }
         // 他按的 OFF 还欠着没落地，或者正排队 —— 让位，别和客人抢。
@@ -810,10 +844,9 @@ final class AppModel: ObservableObject {
             || NetProbe.defaultRouteIsOn(interface: fresh.interfaceName)
         guard live else { return }
 
-        let wasOff = dataSwitchTouched     // 客人之前按过，开关停在 OFF 上
         dataWanted = true
         dataSwitchTouched = true
-        note(wasOff ? "4G 已经在通了，数据开关跟上" : "4G 已经在通了")
+        note("4G 已经在通了")
     }
 
     private func refreshCountersThenSample() {
@@ -855,16 +888,63 @@ final class AppModel: ObservableObject {
 
     /// 上一次运行留在盘上的用量。
     ///
-    /// 跨天 / 跨月的清零交给第一拍 `sampleTraffic` 去做 —— 只有那时候才知道
-    /// 接口计数器的当前读数，也只有那时候才能把增量锚点一起挪对。
+    /// 只有「已验证」的累计值才恢复成真实 4G 月流量；没有验证标记的历史值
+    /// 先迁移到备份键（可回退），不显示。跨天 / 跨月的清零交给第一拍
+    /// `sampleTraffic` 去做 —— 只有那时候才知道接口计数器的当前读数。
     private func restoreUsage() {
         let defaults = UserDefaults.standard
         let today = Self.dayKeyFormatter.string(from: Date())
-        if defaults.string(forKey: AppModel.dayKeyKey) == today {
-            todayBytes = UInt64(defaults.double(forKey: AppModel.dayTotalKey))
+        let month = String(today.prefix(7))
+
+        var verified = defaults.bool(forKey: AppModel.monthVerifiedKey)
+        // 标记只在它所属的那个月有效：跨月后新的一月还没有任何已验证样本，
+        // 不能把上一个月的「已验证」沿用过来。
+        if verified, defaults.string(forKey: AppModel.monthKeyKey) != month {
+            verified = false
         }
-        if defaults.string(forKey: AppModel.monthKeyKey) == String(today.prefix(7)) {
-            monthAccumulated = UInt64(defaults.double(forKey: AppModel.monthTotalKey))
+        monthVerified = verified
+
+        migrateUnverifiedUsageIfNeeded(defaults)
+
+        if monthVerified {
+            let storedMonth = defaults.string(forKey: AppModel.monthKeyKey)
+            let storedDay = defaults.string(forKey: AppModel.dayKeyKey)
+            let lastTotal = (defaults.object(forKey: AppModel.lastTotalKey) as? Double)
+                .map(UInt64.init)
+            let lastInterface = defaults.string(forKey: AppModel.lastTotalInterfaceKey)
+            trafficAccounting = TrafficAccounting(
+                monthKey: storedMonth,
+                monthTotal: storedMonth == month
+                    ? UInt64(defaults.double(forKey: AppModel.monthTotalKey)) : 0,
+                dayKey: storedDay,
+                dayTotal: storedDay == today
+                    ? UInt64(defaults.double(forKey: AppModel.dayTotalKey)) : 0,
+                lastTotal: lastTotal,
+                lastInterface: lastInterface
+            )
+        } else {
+            trafficAccounting = TrafficAccounting()
+        }
+        monthAccumulated = trafficAccounting.monthTotal
+        todayBytes = trafficAccounting.dayTotal
+    }
+
+    /// 一次性迁移：把没有「已验证」标记的历史累计值挪到备份键，保证可回退。
+    ///
+    /// 只搬、不删、不做第二次（`provenanceMigratedKey`）；迁移后这些值不再作为
+    /// 真实 4G 月流量显示。原始键与 `monthVerified` 都保留，需要回退时把
+    /// `monthVerifiedKey` 置回 `true`、`provenanceMigratedKey` 置回 `false` 即可。
+    private func migrateUnverifiedUsageIfNeeded(_ defaults: UserDefaults) {
+        guard !defaults.bool(forKey: AppModel.provenanceMigratedKey) else { return }
+        defer { defaults.set(true, forKey: AppModel.provenanceMigratedKey) }
+
+        guard !monthVerified else { return }
+        // 只备份，不清空。原始键留着便于人工核对 / 回退。
+        if let month = defaults.object(forKey: AppModel.monthTotalKey) {
+            defaults.set(month, forKey: AppModel.monthUnverifiedBackupKey)
+        }
+        if let day = defaults.object(forKey: AppModel.dayTotalKey) {
+            defaults.set(day, forKey: AppModel.dayUnverifiedBackupKey)
         }
     }
 
@@ -880,64 +960,42 @@ final class AppModel: ObservableObject {
 
     /// 读一拍的流量增量，并把「今日 / 本月」往前推。
     ///
-    /// 以前这两个数字是从「当前读数 − 基线」现算的，基线只在跨天那一刻落一次。
-    /// 那个算法有一个会伤到客户的坏法：接口计数器在重启、拔插、换 USB 口之后
-    /// 归零，减法一算，已用流量整段消失，余量环回到 100%，客户照着它用就会超
-    /// 套餐。累加制把看不见的那一段留在盘上。
+    /// 只接受已验证来源（`data.countersVerified`）的读数；首次绑定、接口重建、
+    /// 计数器归零 / 回绕都只重建基线，不把接口生命周期总计数器当成本月增量。
+    /// 所有增量都落在 `TrafficAccounting` 里，可以追溯到具体接口与读数。
     private func sampleTraffic() {
         // 演示和截图路径的用量是夹具写死的（`seedTraffic`），不能被这里改写。
         guard simulator == nil, isConnected else { return }
+        // 没有已验证的 4G 流量来源时，不累计、也不建立基线。
+        guard data.countersVerified else { return }
+
         let defaults = UserDefaults.standard
         let total = data.bytesIn + data.bytesOut
         let today = Self.dayKeyFormatter.string(from: Date())
         let month = String(today.prefix(7))
 
-        // ---- 跨月 / 跨天 ----
-        //
-        // `storedXxx == nil` 那两个分支是给「第一次跑带累加制的版本」的那台机器
-        // 用的：老版本没有累加制，「今日」的定义是「当前读数 − 当天首读」，
-        // 「本月」直接就是接口计数器。第一次不能归零 —— 客户看到用量凭空清零，
-        // 那一下在他眼里就是「流量卡被重置了」，之后他会照着错的余量用。
-        let storedMonth = defaults.string(forKey: AppModel.monthKeyKey)
-        if storedMonth != month {
-            monthAccumulated = storedMonth == nil ? total : 0
-            defaults.set(month, forKey: AppModel.monthKeyKey)
-        }
+        let delta = trafficAccounting.record(total: total,
+                                             interface: data.interfaceName,
+                                             month: month,
+                                             day: today)
+        monthAccumulated = trafficAccounting.monthTotal
+        todayBytes = trafficAccounting.dayTotal
 
-        let storedDay = defaults.string(forKey: AppModel.dayKeyKey)
-        let oldBaseline = UInt64(defaults.double(forKey: AppModel.dayBaseKey))
-        if storedDay != today {
-            if storedDay == nil {
-                todayBytes = total >= oldBaseline ? total - oldBaseline : 0
-            } else {
-                todayBytes = 0
-                // 增量锚点跟着挪：App 关着的那段时间模块还在走，不重新锚，这一
-                // 整段会被算进新的一天。
-                defaults.set(Double(total), forKey: AppModel.lastTotalKey)
-            }
-            defaults.set(today, forKey: AppModel.dayKeyKey)
-        } else if defaults.object(forKey: AppModel.dayTotalKey) == nil {
-            todayBytes = total >= oldBaseline ? total - oldBaseline : 0
-        }
-
-        // ---- 这一拍的增量 ----
-        // 计数器只增不减。变小就是接口重建了（重启、拔插、换 USB 口），当前读数
-        // 本身才是「重建之后走过的量」，整段都算增量 —— 按减法处理的话，重建
-        // 之前的用量会被当成负增量丢掉。
-        let previous = (defaults.object(forKey: AppModel.lastTotalKey) as? Double)
-            .map(UInt64.init)
-        let delta: UInt64 = previous.map { total >= $0 ? total - $0 : total } ?? 0
-        defaults.set(Double(total), forKey: AppModel.lastTotalKey)
+        // 这一拍确实来自已验证来源：把「本月已验证」钉到盘上。
+        monthVerified = true
+        defaults.set(true, forKey: AppModel.monthVerifiedKey)
 
         // 真实流量来自 `NET_RT_IFLIST2` 的计数器，所以这里是实打实的增量而不是
         // 估算。流量环和这条曲线读的是同一个数。
         trafficSamples.append(Double(delta))
         if trafficSamples.count > 48 { trafficSamples.removeFirst(trafficSamples.count - 48) }
 
-        todayBytes += delta
-        monthAccumulated += delta
         defaults.set(Double(todayBytes), forKey: AppModel.dayTotalKey)
         defaults.set(Double(monthAccumulated), forKey: AppModel.monthTotalKey)
+        defaults.set(month, forKey: AppModel.monthKeyKey)
+        defaults.set(today, forKey: AppModel.dayKeyKey)
+        defaults.set(Double(trafficAccounting.lastTotal ?? 0), forKey: AppModel.lastTotalKey)
+        defaults.set(trafficAccounting.lastInterface ?? "", forKey: AppModel.lastTotalInterfaceKey)
     }
 
     // MARK: - Attach / detach
@@ -1170,7 +1228,8 @@ final class AppModel: ObservableObject {
         // The module may be leaving mid-call, taking its audio function with it.
         // Handing the devices back explicitly beats waiting for CoreAudio to
         // notice the device is gone — and it covers the case where the customer
-        // pressed 「切到模块」 by hand, which nothing else would undo.
+        // set the module as the default device by hand (System Settings), which
+        // nothing else would undo.
         if voice.isRouted {
             // 同样是 CoreAudio 枚举，同样在主线程上 —— 走同一条队列。
             Self.voiceDeviceQueue.async { [weak self] in
@@ -1483,25 +1542,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// 客户手填一个 APN（香港虚拟运营商、或套餐 APN 与默认不同时）。
-    ///
-    /// 走 `DataService.configureAPN` 那道入参校验（引号/逗号/换行/空串都拦），
-    /// 写进去之后和手选运营商一样把主人记下来，自动路不再覆盖。
-    func applyCustomAPN(_ apn: String) {
-        let trimmed = apn.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            note("接入点不能为空")
-            return
-        }
-        run("设置接入点") {
-            try self.controller.data.configureAPN(trimmed)
-            self.rememberAPNOwner(manual: true)
-            self.saveCustomAPN(trimmed, for: self.currentSIMKey)
-            self.note("接入点 = \(trimmed)")
-            _ = self.controller.refreshData()
-        }
-    }
-
     /// 卡插上、模块报出运营商之后，自动把 APN 写进模块 —— 客户不用自己点
     /// AUTO，打开 4G 就能联网。
     ///
@@ -1532,16 +1572,6 @@ final class AppModel: ObservableObject {
             as? [String: String]
         let value = dict?[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
         return (value?.isEmpty ?? true) ? nil : value
-    }
-
-    /// 把手填 APN 记到这张卡名下（读不出卡号就不记，免得张冠李戴）。
-    private func saveCustomAPN(_ apn: String, for key: String) {
-        let trimmed = apn.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !key.isEmpty, !trimmed.isEmpty else { return }
-        var dict = (UserDefaults.standard.dictionary(forKey: AppModel.customAPNKey)
-            as? [String: String]) ?? [:]
-        dict[key] = trimmed
-        UserDefaults.standard.set(dict, forKey: AppModel.customAPNKey)
     }
 
     /// 模块里那个 APN 是不是**别的卡**的 —— 是就该改写。
@@ -1784,13 +1814,14 @@ final class AppModel: ObservableObject {
                 self.ensureHostService()
             } else {
                 self.wantsDataLink = false
-                // Hand the default route back to Wi-Fi *before* tearing the PDP
-                // context down; the other order briefly leaves the machine with
-                // no working route at all.
+                // 关数据只停 macOS 网络服务：路由离开模块，数据就断了。
+                // **故意不去活 PDP**：客户真机（固件 .001）实测 `AT+QIDEACT`
+                // 会顺带把模块重启一次，而重启后 ECM 网卡在 macOS 27 上不回来，
+                // 4G 就此失效（比「留着 PDP」糟得多）。模块的 PDP 留着无妨 ——
+                // 路由不在模块上，一个包也出不去。
                 if let service = try? self.controller.data.setHostService(enabled: false) {
-                    self.note("已停用「\(service.name)」，默认路由回到 Wi-Fi")
+                    self.note("已停用「\(service.name)」，4G 数据已关")
                 }
-                try self.controller.data.deactivatePDP()
             }
             _ = self.controller.refreshData()
         }
@@ -1875,6 +1906,14 @@ final class AppModel: ObservableObject {
             noteDataWaitOnce(waitReason)
             return
         }
+        // 这里**不能**用「先拿到 IPv4 再开服务」当闸：macOS 要先启用这条网络
+        // 服务，才会在接口上跑 DHCP、才可能拿到 IPv4。拿 IPv4 当开服务的前置
+        // 条件等于自己卡死自己（无 IP → 不开服务 → 不跑 DHCP → 永无 IP）。
+        //
+        // 所以顺序是：注册成功后照常开服务让 DHCP 跑起来；至于「默认路由别在
+        // 4G 没验证通过之前就被抢过去」，那是 `guardDataRoute()` 的活 —— 它
+        // 用绑定 4G 接口的实测兜底，不通就把默认路由还给 Wi-Fi（有失败上限和
+        // 冷却，见 routeRollback* / probeCooldown）。
         dataWaitNote = nil
 
         // 2026-09-27：这一句要拉一个 `networksetup` 进程，真机实测 3–4 秒才
@@ -1925,8 +1964,12 @@ final class AppModel: ObservableObject {
     /// 一条红字。这里补的只是 `networksetup` 那一下 —— 状态和那句话都由客人
     /// 那一步自己负责写，这一下不抢。
     private func undoLateHostServiceEnable() {
+        // 第十二轮诊断：这是唯一一条「不写活动列表」的停用路径。记进日志，
+        // 否则它触发时服务被关却查无出处，会被误当成外部程序干的。
+        AppLog.log("网络服务写入 撤销迟到的启用（undoLateHostServiceEnable）：服务将被停用")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            _ = try? self?.controller.data.setHostService(enabled: false)
+            let service = try? self?.controller.data.setHostService(enabled: false)
+            AppLog.log("网络服务写入 撤销迟到启用 结果=\(service != nil ? "成功" : "失败")")
         }
     }
 
@@ -2062,7 +2105,8 @@ final class AppModel: ObservableObject {
                                       linkWasUp: hostLinkWasUp,
                                       trouble: trouble,
                                       hasInterface: data.hasInterface,
-                                      routeOnModule: routeOnModule) {
+                                      routeOnModule: routeOnModule,
+                                      ipv4Empty: data.ipv4Address.isEmpty) {
             // 节拍：这一段每两三秒被叫一次，而底下那一跳要拉进程、还要读一遍
             // 模块。「收了也收不回来」的机器不能靠这个循环刷屏，见常量。
             if let last = hostRestoreLastTry,
@@ -2070,6 +2114,17 @@ final class AppModel: ObservableObject {
             // 这一段的第一跳才说话：后面每一跳都在做同一件事，说第二遍只是把
             // 上面那句挤走。
             if hostRestoreLastTry == nil {
+                // 第十二轮诊断：把「缓存判据」和「真实状态」并排记下，区分
+                // 「服务真被关掉」与「路由暂时不在模块上」两类异常 —— 判据是
+                // 免费的（路由表 + 缓存字段，不拉子进程、不卡主线程）。
+                // ipv4 还在 = 网卡还活着（服务大概率没被关，只是路由短暂漂走）；
+                // ipv4 空了 = 服务被关 / 接口丢了地址。
+                let actualRoute = NetProbe.defaultRouteInterface()
+                AppLog.log("网络服务自愈判定 svc=\(data.serviceName) iface=\(data.interfaceName)"
+                    + " routeOnModule=\(routeOnModule) actualRoute=\(actualRoute.isEmpty ? "无" : actualRoute)"
+                    + " svcEnabled=\(data.serviceEnabled) ipv4=\(data.ipv4Address.isEmpty ? "空" : data.ipv4Address)"
+                    + " wanted=\(dataWanted) wasUp=\(hostLinkWasUp) hasIface=\(data.hasInterface)"
+                    + " trouble=\(trouble ?? "无")")
                 // 屏幕黑着就只写日志、不进活动列表。macOS 夜里为了维护会反复
                 // 暗唤醒（`pmset -g log` 里那一串 DarkWake 是 USB 和网络触发
                 // 的），每唤醒一次 USB 就重新枚举一遍模块，这条服务跟着被关
@@ -2152,8 +2207,14 @@ final class AppModel: ObservableObject {
                                       linkWasUp: Bool,
                                       trouble: String?,
                                       hasInterface: Bool,
-                                      routeOnModule: Bool) -> Bool {
-        dataWanted && linkWasUp && trouble == nil && hasInterface && !routeOnModule
+                                      routeOnModule: Bool,
+                                      ipv4Empty: Bool) -> Bool {
+        // 第十二轮：路由短暂漂到 Wi-Fi ≠ 服务被关。只有网卡连 IPv4 都没了
+        // （macOS 停用一条服务时会把它的 IP 一起拿走）才算「服务真被关」。
+        // 路由漂走而 IP 还在，是默认路由的瞬时变化，等它自己回来即可，不需要
+        // 也不应该重新启停服务 —— 否则就造出「被关掉→开回来」的假故障。
+        dataWanted && linkWasUp && trouble == nil && hasInterface
+            && !routeOnModule && ipv4Empty
     }
 
     // MARK: - 「模块的网卡被系统漏掉」的自愈
@@ -2213,6 +2274,13 @@ final class AppModel: ObservableObject {
         // 模块正在重启、手上还有别的活：等下一拍。
         guard !awaitingReconnect, !isWorking else { return }
 
+        // 这里只认 `interfaceStranded`（网卡在 IOKit 里、却没 BSD 名字）这一种，
+        // 那种情况 `AT+CFUN=1,1` 重新枚举确实救得回来。
+        //
+        // 2026-10-26 客户真机（macOS 27.0.1）证明：**「模块侧全好却压根没枚举出
+        // 网卡」这一种不能靠 CFUN 重启救** —— 客户那边每次开关数据，15 秒后
+        // 这里就重启一次模块，重启完网卡还是不回来，4G 更糟。所以把「无网卡」
+        // 的自愈撤掉，只留「无名网卡」这一种（原来的、被真机验证过的那条）。
         guard Self.shouldRebootForStrandedInterface(
             wanted: true,
             connected: true,
@@ -2220,7 +2288,7 @@ final class AppModel: ObservableObject {
             consoleLocked: controller.data.consoleLocked,
             callIdle: call.state == .idle,
             gaveUp: strandedGaveUp) else {
-            // 网卡其实好好的（`interfaceStranded` 为假）——把观察窗清掉。
+            // 不是「无名网卡」——把观察窗清掉。
             if !data.interfaceStranded { strandedSince = nil }
             return
         }
@@ -2816,9 +2884,9 @@ final class AppModel: ObservableObject {
             // 写「没接到」和事实相反。「挂断全部」把第二路一起挂掉，同理。
             if waiting { self.callHistory.markRejectedWaiting() } else { self.callHistory.markHungUp() }
             try self.controller.calls.hangup()
-            // 客户手动按过「切到模块」的话，挂断时把设备还回去 —— 这是唯一
-            // 会主动撤销手动选择的地方，因为留在一个单向设备上的代价（电脑
-            // 没声音了）比留着一个用不上的选择大得多。
+            // 客户在系统设置里把模块设成默认音频的话，挂断时把设备还回去 ——
+            // 留在一个单向设备上的代价（电脑没声音了）太大。`deactivate()` 只在
+            // 这个 App 自己切过去的时候才真动设备，不会抢客户的手动选择。
             _ = self.controller.voice.deactivate()
             self.refreshVoice()
         }
@@ -2829,27 +2897,6 @@ final class AppModel: ObservableObject {
         callAction(waiting ? "拒接新来电" : "拒接", .reject) {
             if waiting { self.callHistory.markRejectedWaiting() } else { self.callHistory.markRejected() }
             try self.controller.calls.reject()
-        }
-    }
-
-    /// 客户自己按的「切到模块」：把**系统默认**输入输出指到模块的 USB 声卡上。
-    ///
-    /// 不是通话语音的必经之路 —— 通话走 `CallAudioBridge`，直接绑设备，不动
-    /// 默认设备。这个按钮留着只为一件事：客户想拿模块当普通 USB 声卡用
-    /// （比如在系统设置里自己挑设备试音）。模块把 UAC 拆成两个单向设备，
-    /// 所以指过去以后电脑自己的音乐和提示音会一起改道，挂断时自动还回来。
-    func routeAudioToModule() {
-        // 这一读留在主线程：按钮回调本来就在主线程，而 `voice` 是 @Published，
-        // 从下面那个后台 body 里读它等于和主线程的写入抢同一个字段。
-        let alreadyRouted = voice.isRouted
-        run("切换模块声卡") {
-            let status = alreadyRouted
-                ? self.controller.voice.refreshStatus()
-                : try self.controller.voice.activate()
-            self.setOnMain { self.voice = status }
-            if status.isRouted {
-                self.note("已把系统默认音频切到模块；挂断时会自动还回去")
-            }
         }
     }
 
@@ -3036,32 +3083,6 @@ final class AppModel: ObservableObject {
         })
     }
 
-    /// 一键把通话语音装上：解锁 ADB → 加载厂商语音驱动 → 下发出厂语音校准
-    /// → 起 PCM 桥 → 打开 audio_enable。已经在的部分自动跳过，所以它可以
-    /// 反复点 —— 客户不需要知道哪一步做过了。
-    ///
-    /// 第一步会重启一次模块（`AT+QCFG` 写完要 `AT+CFUN=1,1`），**所以这个
-    /// 动作不能在通话里跑**：桥挂在 USB 声卡上，重启会把刚接通的通话变成
-    /// 一通没声音的电话。通话窗口里那个按钮因此只在空闲时出现。
-    func installCallVoice() {
-        // 先立起重启窗口：安装中间模块会消失一阵，三秒一次的重连失败写出来
-        // 就是客户自己点出来的一片红字，而它只是这个动作的一部分。
-        beginAwaitReconnect(seconds: 180)
-        note("开始安装通话语音；模块会重启一次，等它回来会自动重连")
-        run("安装通话语音") {
-            let final = try self.voiceProvision.install { progress in
-                switch progress {
-                case .step(let name): self.note("… \(name)")
-                case .done(let name): self.note("✓ \(name)")
-                }
-            }
-            self.setOnMain { self.voiceSetup = final }
-            if !final.ready {
-                self.note("通话语音还差一步：\(final.summary)")
-            }
-        }
-    }
-
     /// 通话语音该不该自己补一遍。给定时器和「刚连上」共用。
     ///
     /// 这里刻意**不**预读任何东西：`voiceSetup.ready` 为真时直接返回，
@@ -3079,16 +3100,12 @@ final class AppModel: ObservableObject {
         runVoiceAutoRepair()
     }
 
-    /// 把丢掉的那几步补回来。
+    /// 把丢掉的那几步补回来，**全程自动，客户不用点任何按钮**。
     ///
-    /// **只补不需要重启模块的部分。** ADB 那一位没翻起来时必须走
-    /// `AT+CFUN=1,1`，模块会消失二十秒、网也断一下 —— 那种动作只能由客户
-    /// 自己点「一键安装」，不能背着他做。所以这里一看到 adb 不通就
-    /// 收手，把界面留给那个按钮去解释。
-    ///
-    /// 反过来，`adb` 已经通的时候整条 `install()` 里一步重启都没有（见
-    /// `install` 的第 1 步），插拔一次模块正是这种情况：usbcfg 存在模块的
-    /// NVRAM 里，掉的只有内核里的驱动。
+    /// 第一次安装（ADB 位还没翻）时 `install()` 的第 1 步会走 `AT+CFUN=1,1`
+    /// 重启一次模块 —— 以前这一步留给「一键安装」按钮，是怕背着客户重启；
+    /// 现在按客户要求封装成自动：模块连上、空闲时自己把整条语音通路装完，
+    /// 界面只显示状态。重启前先开重连窗口，免得那二十秒被轮询写成红字。
     private func runVoiceAutoRepair() {
         isRepairingVoice = true
         voiceRepairing = true
@@ -3097,12 +3114,16 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             let status = self.voiceProvision.inspect()
 
-            guard status.moduleReachable, status.adbUnlocked else {
+            // 剩下两种情况才退后重试，其余全部交给 install() 自动做：
+            //  · adb 已经连上（moduleReachable）→ 直接装，缺哪步补哪步；
+            //  · 全新模块（adb 位还没翻，adbUnlocked=false）→ 也直接装，
+            //    install() 第 1 步会解锁 ADB + CFUN 重启，不再留给客户点按钮；
+            //  · adb 位已翻、但 adbd 还没扫到模块（moduleReachable=false 且
+            //    adbUnlocked=true）→ 这才是「还轮不到我」，退后重试。
+            guard status.moduleReachable || !status.adbUnlocked else {
                 // 这一档不是失败，是「还轮不到我」：模块刚插上时 adbd 还在起、
-                // AT 通道也未必立刻答话，而这几分钟恰恰是客户插回来等声音的
-                // 时候。所以头三次退一分钟就再看一眼；连着三次都没成（多半是
-                // ADB 位压根没翻，那要客户点按钮），再退回五分钟一档，免得
-                // 白烧 CPU、白刷模块的 dmesg。
+                // AT 通道也未必立刻答话。头三次退一分钟就再看一眼；连着三次
+                // 都没成再退回五分钟一档，免得白烧 CPU、白刷模块的 dmesg。
                 // 2026-09-26 实测：这一档原先一律退五分钟，插上后要等 5 分半
                 // 才自己好；原因就是首次尝试撞在 adbd 还没起来的那几秒上。
                 self.setOnMain {
@@ -3110,9 +3131,7 @@ final class AppModel: ObservableObject {
                     let wait: TimeInterval = self.voiceAdbWaitAttempts <= 3 ? 60 : 300
                     if !self.voiceBailLogged {
                         self.voiceBailLogged = true
-                        self.note(status.moduleReachable
-                                  ? "通话语音还在准备中，一分钟后再自动检查一次"
-                                  : "通话语音在等模块连上，一分钟后再自动检查")
+                        self.note("通话语音在等模块连上，一分钟后再自动检查")
                     }
                     self.voiceSetup = status
                     self.voiceSetupVerifiedAt = Date()
@@ -3135,6 +3154,12 @@ final class AppModel: ObservableObject {
                     self.voiceBailLogged = false
                 }
                 return
+            }
+
+            // ADB 还没解锁时 install() 第 1 步会重启一次模块。提前打开重连窗口，
+            // 免得重启那二十秒被三秒一次的轮询写成一片红字。
+            if !status.adbUnlocked {
+                self.setOnMain { self.beginAwaitReconnect(seconds: 180) }
             }
 
             do {
@@ -3254,7 +3279,7 @@ final class AppModel: ObservableObject {
                     self.note(readiness.ready
                               ? "通话语音接通失败：\(error)"
                               : "这通电话没有语音通路：\(readiness.summary)。"
-                                + "挂断后在「通话」窗口点「一键安装」补上，补完再拨就有声音了")
+                                + "程序会自动补装，装好再拨就有声音了")
                     guard self.call.state.isBusy,
                           attempt < Self.callStartAttemptsLimit else { return }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
@@ -3265,15 +3290,15 @@ final class AppModel: ObservableObject {
                 return
             }
 
-            // 桥起来了。体检照旧问一遍 —— 界面上的「就绪度」和那个「一键安装
-            // 通话语音」的按钮都靠它，只是它不再挡在声音前面。
+            // 桥起来了。体检照旧问一遍 —— 界面上的「就绪度」靠它，只是它
+            // 不再挡在声音前面。
             let readiness = self.voiceProvision.inspect()
             self.setOnMain {
                 self.voiceSetup = readiness
                 self.voiceSetupVerifiedAt = Date()
                 if !readiness.ready {
                     self.note("这通电话的语音通路不完整：\(readiness.summary)。"
-                              + "挂断后在「通话」窗口点「一键安装」补上")
+                              + "程序会自动补装")
                 }
             }
         })
@@ -3302,6 +3327,7 @@ final class AppModel: ObservableObject {
             self.setOnMain {
                 self.callVoiceLive = false
                 self.callLevels = CallAudioBridge.Levels()
+                self.callMuted = false
                 // 留一行能查的证据。两个峰值都是 0 = 这条通路一个采样点都没过
                 // 声音，和「客户没说话」是两回事，隔着微信也能判断。
                 self.note(String(format: "通话语音已断开（%d 秒，上行峰值 %.4f / 下行峰值 %.4f）",
@@ -3424,7 +3450,11 @@ final class AppModel: ObservableObject {
                     // 算，否则 0.25 秒之后的下一拍就会拿着「四个环节都没跑过」
                     // 的零记录当场判一次「断了」，把仅剩的那次机会白烧掉。
                     self.callActiveSince = nil
-                    self.note(rearmed ? "通话语音已重接（语音通路已重挂）" : "通话语音已重接")
+                    // rearm 为真表示 DSP 已确认（Sent VocProc Cal），否则只是
+                    // 桥重建了、语音通路重挂没确认 —— 如实说，不冒充恢复成功。
+                    self.note(rearmed
+                              ? "通话语音已重接（语音通路已重挂）"
+                              : "通话语音桥已重建，但语音通路重挂未确认")
                 }
                 self.startCallLevelTimer()
             } catch {
@@ -3590,11 +3620,30 @@ final class AppModel: ObservableObject {
 
 extension AppModel {
     var bars: Int { signal.bars }
-    var dataUsedGB: Double { Double(monthBytes) / 1_000_000_000 }
-    var remainingGB: Double? { quotaGB > 0 ? max(0, quotaGB - dataUsedGB) : nil }
+    /// 「本月流量」的呈现状态，面板据此决定显示「暂无数据 / 暂无法统计 /
+    /// 本月 X / 已记录的4G流量 X」。
+    var trafficDisplay: TrafficDisplayState {
+        if simulator != nil { return .live }
+        return .resolve(isConnected: isConnected,
+                        countersVerified: data.countersVerified,
+                        monthVerified: monthVerified)
+    }
+
+    /// 可参与余量计算的已验证本月用量；没有时返回 `nil`，余量环回退到信号显示。
+    var verifiedMonthBytes: UInt64? {
+        switch trafficDisplay {
+        case .live, .historical: return monthBytes
+        case .noData, .unavailable: return nil
+        }
+    }
+
+    var remainingGB: Double? {
+        guard quotaGB > 0, let used = verifiedMonthBytes else { return nil }
+        return max(0, quotaGB - Double(used) / 1_000_000_000)
+    }
     var remainingFraction: Double {
-        guard quotaGB > 0 else { return Double(bars) / 5 }
-        return max(0, min(1, (quotaGB - dataUsedGB) / quotaGB))
+        guard quotaGB > 0, let used = verifiedMonthBytes else { return Double(bars) / 5 }
+        return max(0, min(1, (quotaGB - Double(used) / 1_000_000_000) / quotaGB))
     }
     var signalCaption: String {
         if let rsrp = signal.rsrp { return String(format: "%.0f dBm", rsrp) }

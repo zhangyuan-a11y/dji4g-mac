@@ -86,7 +86,7 @@ public final class ModuleVoiceSetup {
             if adbBinary == nil { return "通话语音组件没装全，重装一次这个软件" }
             if !moduleReachable {
                 return adbUnlocked
-                    ? "模块在，但还没准备好（拔插一次或点「一键安装」）"
+                    ? "模块在，但还没准备好（会自动补装）"
                     : "没看到模块，检查线有没有插好"
             }
             if !adbUnlocked { return "还没装过通话语音（会重启模块一次）" }
@@ -318,11 +318,17 @@ public final class ModuleVoiceSetup {
         try ModuleIdentityGate.requireGenerationOne(session)
 
         // 1) 解锁 ADB —— 没解锁后面一步都做不了。
-        if !adbAppears(within: 0) {
+        // 新起的 adb daemon 需要几秒才能扫到 USB 设备；先重扫一次再短等，
+        // 避免把「刚连上还没扫到」误判成「没开 ADB」而去重启模块（第十四/十五轮）。
+        adb.restartServer()
+        if !adbAppears(within: 8) {
             report("第 1 步 · 准备模块")
             try raiseADB(report: report)
         }
         progress?(.done("第 1 步 好了"))
+
+        // 强制 VoLTE：ims 出厂默认的 auto(0) 档会让通话下行静音，见 forceVoLTE 注释。
+        try forceVoLTE()
 
         // 2) 把资源推上去并加载驱动。
         var status = inspect()
@@ -368,6 +374,27 @@ public final class ModuleVoiceSetup {
         let final = inspect()
         progress?(.done(final.summary))
         return final
+    }
+
+    /// 只开 ADB：交口令 + 把 usbcfg 的 adb 位翻成 1 + 必要时重启一次，
+    /// 等 ADB 接口重新枚举。**不安装语音运行时**（不推 .ko、不校准、不起 PCM 桥）。
+    ///
+    /// 给「先开 ADB、后装语音」的两段式流程用（第十四轮只走到这一步就停）。
+    /// 复用 `raiseADB` 的同一套已审核解锁逻辑，不做任何私有绕过。
+    @discardableResult
+    public func enableADB(progress: ((Progress) -> Void)? = nil) throws -> Status {
+        let report: (String) -> Void = { progress?(.step($0)) }
+        // 型号门禁：只对一代 QDC507 生效，与完整安装路径一致。
+        if let session {
+            try ModuleIdentityGate.requireGenerationOne(session)
+        }
+        adb.restartServer()
+        if !adbAppears(within: 8) {
+            report("第 1 步 · 解锁 ADB")
+            try raiseADB(report: report)
+        }
+        progress?(.done("ADB 已就绪"))
+        return inspect()
     }
 
     // MARK: - 复原
@@ -585,12 +612,69 @@ public final class ModuleVoiceSetup {
         try session.send("AT+CFUN=1,1", timeout: 8)
     }
 
+    /// 强制模块走 VoLTE 语音（`AT+QCFG="ims",1`）。
+    ///
+    /// 2026-10-26 真机定位：`ims` 出厂默认是 0（交给 MBN 自动决定）。这个档位
+    /// 下，10086 实测通话**下行**整整 20 秒峰值 0.000（上行有底噪）——模块这头
+    /// 声卡 / 校准 / 桥全都在、`ims` 的 state 也显示 1，但下行一个采样点都没过来。
+    /// 改成 1（强制开）并重启后，下行立刻恢复（峰值 0.3~0.6，自动台语音清晰）。
+    ///
+    /// 根因：本 App 的 `mavo-pcm-bridge` 只路由 VoLTE 通路（hw:0,4）；`ims` 在
+    /// auto 档时部分通话会落到 CS-Voice（hw:0,2），桥接的那条腿就静音。强制
+    /// VoLTE 让通话稳定留在 hw:0,4 上。
+    ///
+    /// Quectel 的 QCFG 会自动保存，这条命令持久化，重复发幂等。注意：本配置在
+    /// **模块下次重启后**才生效；install 每次模块上电/重插都会跑一遍，所以
+    /// 更新后最多一次模块重启就会稳定在 VoLTE 上。
+    private func forceVoLTE() throws {
+        guard let session else { throw SetupError.atRequired }
+        _ = try session.send(Self.voLTEForceCommand(), timeout: 8)
+    }
+
+    /// 强制 VoLTE 的 AT 命令。抽成纯函数，自检里逐字符核对，防止命令打错。
+    public static func voLTEForceCommand() -> String {
+        "AT+QCFG=\"ims\",1"
+    }
+
+    /// 从 `+QCFG: "ims",<conf>,<state>` 里抠出 <conf>。
+    ///
+    /// 0 = 交给 MBN 自动决定（出厂默认）、1 = 强制开、2 = 关。两种形状都吃：
+    /// 原始返回行（带 `+QCFG:`）和 `ATResponse.firstValue(for:)` 掐掉前缀的
+    /// 返回值（`"ims",0,1`）。抠不到就返回 nil，不猜。
+    public static func imsConfig(from line: String) -> Int? {
+        var text = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let colon = text.firstIndex(of: ":"),
+           text[text.startIndex..<colon].firstIndex(of: "\"") == nil {
+            text = String(text[text.index(after: colon)...])
+        }
+        let parts = text.split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard parts.count >= 2 else { return nil }
+        return Int(parts[1])
+    }
+
+    /// 这个 <conf> 是否需要补一发强制 VoLTE。
+    ///
+    /// 只有 1（已经强制开）不用动；0（auto）和 2（关）都要强制成 1；读不到
+    /// （nil）也强制 —— 幂等，多发一次无害。这正是 2026-10-26 真机下行静音
+    /// 的判据：auto 档会落到 CS-Voice，而桥只路由 VoLTE。
+    public static func needsVoLTEForce(conf: Int?) -> Bool {
+        conf != 1
+    }
+
     /// 静静等一轮：`adb devices` 里出现模块就 true，到点还没有就 false。
     /// 不抛错 —— 调用方通常还要接着试别的办法。
     private func adbAppears(within seconds: TimeInterval) -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
+        var lastRescan = Date.distantPast
         while true {
-            if (try? adb.run(["devices"]))?.contains("\tdevice") == true { return true }
+            if adb.deviceState() == .ready { return true }
+            // 模块重启后 adb daemon 可能握着旧的 transport_id，看不见重新
+            // 枚举出来的新设备 —— 每隔 10 秒重扫一次，别干等到超时（第十四轮）。
+            if Date().timeIntervalSince(lastRescan) >= 10 {
+                adb.restartServer()
+                lastRescan = Date()
+            }
             if Date() >= deadline { return false }
             Thread.sleep(forTimeInterval: 2)
         }
@@ -695,58 +779,38 @@ public final class ModuleVoiceSetup {
 
     // MARK: - 每一通都重挂一次语音通路
 
-    /// 把出厂那四条语音命令**再下发一遍**（幂等）。返回 true 表示确实写进去了。
+    /// 每一通电话前重挂一次语音通路。返回 true 表示通路确实重新挂好了。
     ///
-    /// 为什么每通电话都要来这一下：`inspect()` 只能证明 `alsaucm_test` 进程
-    /// 还在、FIFO 还在，**证明不了 `Voice Call` 这个 verb 还挂在混音器上**。
-    /// 而模块在通话结束、USB 重配、休眠回来这些时刻都可能把混音器状态收掉；
-    /// 那时候五个前置条件一条不差、界面上写着「已就绪」，接起来就是一声没有，
-    /// 而且全程不报错 —— 这正是 2026-09-28 那几通电话的形状。
+    /// 2026-10-26 真机定位（第二通没声音的根因）：这里以前是往 FIFO 重发
+    /// alsaucm 的「Voice Call」verb —— 那套 verb 落的是 **CSVoice** mixer，
+    /// 是 CS 语音的通路。而 `ims` 强制 VoLTE 之后，真正的下行走的是
+    /// `mavo-pcm-bridge` 的 **VoLTE** 通路（hw:0,4）；模块每通结束都会把
+    /// VoLTE 下行收掉，重发 CSVoice verb 既救不了 VoLTE，还会把 VoLTE mixer
+    /// 盖掉，结果**第一通也静音**。
     ///
-    /// 写之前先确认读者活着、而且**不是 D 状态**：进程卡在 D 状态时写 FIFO
-    /// 会把调用方一起拖住，那种卡死连 `kill -9` 都解不开，只能重启模块。
-    /// 写本身也带兜底：万一没人读，最多等两秒就放弃 —— 绝不让一通电话卡在
-    /// 这一步上。写成功（或明确失败）各echo一行，调用方按行判断。
+    /// 正确做法是**把 PCM 桥重启一遍**：桥起的时候会重新打开 hw:0,4 并重新
+    /// 断言 VoLTE mixer，下一通下行就回来了。实测：挂断后只重发 verb 下行
+    /// 仍是 0，重启桥后立刻恢复（峰值 0.2~0.5）。
+    ///
+    /// 实现上用一条轻量 shell 完成「杀旧桥 → 起新桥 → 等 4 秒」，不做
+    /// `inspect()`：inspect 的 probe 要遍历整个 /proc，通话期间又慢又和别的
+    /// adb 操作抢同一个 server。桥活没活着，交给 watchdog 的峰值判断。
     @discardableResult
     public func rearmVoiceCall(timeout: TimeInterval = 8) -> Bool {
         guard adb.binary != nil else { return false }
         let script = """
-        FIFO=\(Self.calibrationFIFO)
-        REARM_OUT=/var/tmp/rearm.out
-        rm -f "$REARM_OUT" 2>/dev/null
-        [ -p "$FIFO" ] || { echo "NO_FIFO"; exit 0; }
-        state=""
         for d in /proc/[0-9]*; do
-          [ "$(cat $d/comm 2>/dev/null)" = "alsaucm_test" ] || continue
-          s=$(sed 's/^[^)]*) //' $d/stat 2>/dev/null | cut -c1)
-          [ "$s" = "Z" ] && continue
-          state="$s"
+          [ "$(cat $d/comm 2>/dev/null)" = "mavo-pcm-bridge" ] || continue
+          [ "$(sed 's/^[^)]*) //' $d/stat 2>/dev/null | cut -c1)" = Z ] && continue
+          kill -9 "$(basename $d)" 2>/dev/null
         done
-        [ -n "$state" ] || { echo "NO_READER"; exit 0; }
-        [ "$state" = "D" ] && { echo "READER_STUCK"; exit 0; }
-        (
-          {
-            echo "set _verb Voice Call"
-            echo "set _enadev Auxpcm Rx"
-            echo "set _enadev Auxpcm Tx"
-          } > "$FIFO" 2>/dev/null && echo "WROTE" > "$REARM_OUT"
-        ) &
-        w=$!
-        i=0
-        while [ $i -lt 20 ]; do
-          kill -0 $w 2>/dev/null || break
-          sleep 0.1
-          i=$((i+1))
-        done
-        if kill -0 $w 2>/dev/null; then
-          kill -9 $w 2>/dev/null
-          echo "WRITE_TIMEOUT"
-        else
-          cat "$REARM_OUT" 2>/dev/null || echo "WRITE_UNKNOWN"
-        fi
+        echo 1 > \(Self.audioEnableSwitch)
+        nohup setsid \(Self.stagingDirectory)/\(Self.bridgeBinary) --voice-route-session --verbose >>/var/tmp/bridge.log 2>&1 </dev/null &
+        sleep 4
+        echo REARM_OK
         """
-        let output = (try? adb.shell(script, timeout: timeout)) ?? ""
-        return Self.lines(in: output).contains("WROTE")
+        let output = (try? adb.shell(script, timeout: timeout + 12)) ?? ""
+        return output.contains("REARM_OK")
     }
 
     /// 停掉 PCM 桥。校准必须在**没有桥占着语音通路**的时候做：桥在跑的时候
@@ -977,6 +1041,23 @@ public final class ADBRunner {
     public let binary: String?
     private let port: String
 
+    /// ADB 设备状态。第十五轮把「出现/没出现」的二值判断拆成六种，供界面和
+    /// 自检分别处理：不是所有「没看到 device」都等于「没连上」。
+    public enum DeviceState: Equatable {
+        /// adb server 没起来，或 adb 二进制缺失。
+        case noDaemon
+        /// 没有设备行（接口未出现 / 正在重新枚举）。
+        case noDevice
+        /// 设备在，但未授权。
+        case unauthorized
+        /// 设备在，但离线。
+        case offline
+        /// 设备已连接、已授权。
+        case ready
+        /// adb 命令本身失败。
+        case failed
+    }
+
     public init() {
         self.binary = Self.locate()
         self.port = ProcessInfo.processInfo.environment["DJI4G_ADB_PORT"] ?? "5039"
@@ -1042,6 +1123,37 @@ public final class ADBRunner {
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8) ?? ""
+    }
+
+    /// 读当前 adb 设备状态（只读、非破坏性）。`adb devices` 的每一行是
+    /// `<serial>\t<state>`，状态只能是 device / offline / unauthorized 之一。
+    public func deviceState(timeout: TimeInterval = 30) -> DeviceState {
+        guard binary != nil else { return .noDaemon }
+        guard let output = try? run(["devices"], timeout: timeout) else { return .failed }
+        return Self.parseDeviceState(output)
+    }
+
+    /// 把 `adb devices` 的原始输出解析成设备状态（纯函数，供自检喂字符串）。
+    public static func parseDeviceState(_ output: String) -> DeviceState {
+        for line in output.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, trimmed.contains("\t") else { continue }
+            if trimmed.hasSuffix("\tdevice") { return .ready }
+            if trimmed.hasSuffix("\tunauthorized") { return .unauthorized }
+            if trimmed.hasSuffix("\toffline") { return .offline }
+        }
+        return .noDevice
+    }
+
+    /// 重启本端口（5039）的 adb server，强制它重新扫一次 USB。
+    ///
+    /// 模块 `AT+CFUN=1,1` 重启后，老的 adb daemon 常常还握着旧的
+    /// transport_id、看不见重新枚举出来的新设备（第十四轮假失败根因）。
+    /// 重扫是安全且非破坏性的：只影响本 App 自己起的那个 server，不碰
+    /// 客户可能正在用的 5037。
+    public func restartServer() {
+        _ = try? run(["kill-server"], timeout: 15)
+        _ = try? run(["start-server"], timeout: 15)
     }
 
     /// 在模块上跑一条 shell 命令。

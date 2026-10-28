@@ -481,6 +481,16 @@ func runSelfTest() -> Bool {
           CallService.preferred([CallInfo(index: 1, state: .held, number: "A")])?.number == "A")
     check("没有通话时返回空", CallService.preferred([]) == nil)
 
+    // --- 通话时长用单调时钟，墙钟跳变不影响 ---
+    let uptimeStart = ProcessInfo.processInfo.systemUptime - 10
+    let timedCall = CallInfo(index: 1, direction: .outgoing, state: .active,
+                             number: "10086", startedAt: Date().addingTimeInterval(-10),
+                             startedUptime: uptimeStart)
+    check("通话时长按单调时钟算（约 10 秒）",
+          timedCall.duration.map { abs($0 - 10) < 1 } == true)
+    check("空闲状态没有时长（不会把未接通的当接通计时）",
+          CallInfo(index: 1, state: .idle, number: "10086").duration == nil)
+
     // --- 通话记录
     //
     // 模块**不给**通话历史：`AT+CLCC` 报的只有「此刻在响 / 在通」的那几路，
@@ -760,6 +770,77 @@ func runSelfTest() -> Bool {
           ModuleVoiceSetup.adbBit(inUsbcfg: "\"usbcfg\",1,1,1") == nil
           && ModuleVoiceSetup.usbcfg("\"usbcfg\",1,1,1", settingAdbBit: 1) == nil)
 
+    // --- 强制 VoLTE（2026-10-26 真机定位：ims auto 档通话下行静音）---
+    check("ims：强制 VoLTE 命令逐字符正确",
+          ModuleVoiceSetup.voLTEForceCommand() == "AT+QCFG=\"ims\",1")
+    check("ims：auto 档（0）解析出来",
+          ModuleVoiceSetup.imsConfig(from: "+QCFG: \"ims\",0,1") == 0)
+    check("ims：强制开档（1）解析出来",
+          ModuleVoiceSetup.imsConfig(from: "+QCFG: \"ims\",1,1") == 1)
+    check("ims：关档（2）解析出来",
+          ModuleVoiceSetup.imsConfig(from: "\"ims\",2,0") == 2)
+    check("ims：firstValue 掐掉前缀的返回也读得出",
+          ModuleVoiceSetup.imsConfig(from: "\"ims\",0,1") == 0)
+    check("ims：字段不够返回 nil",
+          ModuleVoiceSetup.imsConfig(from: "\"ims\"") == nil)
+    check("ims：auto 档需要强制 VoLTE",
+          ModuleVoiceSetup.needsVoLTEForce(conf: 0))
+    check("ims：关档需要强制 VoLTE",
+          ModuleVoiceSetup.needsVoLTEForce(conf: 2))
+    check("ims：已经强制开就不用再发",
+          !ModuleVoiceSetup.needsVoLTEForce(conf: 1))
+    check("ims：读不到 conf 也强制（幂等安全）",
+          ModuleVoiceSetup.needsVoLTEForce(conf: nil))
+
+    // --- ADB 设备状态解析（第十五轮：六态区分，不再二值判断）---
+    check("ADB 状态：device 行 → ready",
+          ADBRunner.parseDeviceState("List of devices attached\nABC123\tdevice\n") == .ready)
+    check("ADB 状态：unauthorized 行 → unauthorized",
+          ADBRunner.parseDeviceState("List of devices attached\nABC123\tunauthorized\n") == .unauthorized)
+    check("ADB 状态：offline 行 → offline",
+          ADBRunner.parseDeviceState("List of devices attached\nABC123\toffline\n") == .offline)
+    check("ADB 状态：空列表 → noDevice",
+          ADBRunner.parseDeviceState("List of devices attached\n") == .noDevice)
+    check("ADB 状态：带前导空格的 device 行也认得出",
+          ADBRunner.parseDeviceState("List of devices attached\n  ABC123\tdevice\n") == .ready)
+    check("ADB 状态：多设备里有一条 unauthorized 不被误当 ready",
+          ADBRunner.parseDeviceState("List of devices attached\nABC\tunauthorized\n") == .unauthorized)
+
+    // --- 语音初始化状态机（第十五轮：短标签区分各态，纯函数可测）---
+    do {
+        var readyStatus = ModuleVoiceSetup.Status()
+        readyStatus.moduleReachable = true
+        readyStatus.adbUnlocked = true
+        readyStatus.driversLoaded = true
+        readyStatus.calibrated = true
+        readyStatus.bridgeRunning = true
+        readyStatus.audioEnabled = true
+        readyStatus.soundCardPresent = true
+        check("语音状态机：全部就绪 → ready / 已就绪",
+              readyStatus.ready && readyStatus.shortLabel == "已就绪")
+    }
+    do {
+        let missing = ModuleVoiceSetup.Status()   // adbBinary == nil
+        check("语音状态机：缺内置组件 → 缺少组件",
+              !missing.ready && missing.shortLabel == "缺少组件")
+    }
+    do {
+        var notInstalled = ModuleVoiceSetup.Status()
+        notInstalled.adbBinary = "/app/adb"
+        notInstalled.moduleReachable = true
+        notInstalled.adbUnlocked = true
+        check("语音状态机：ADB 已开但驱动没装 → 未安装",
+              !notInstalled.ready && notInstalled.shortLabel == "未安装")
+    }
+    do {
+        var noAdb = ModuleVoiceSetup.Status()
+        noAdb.adbBinary = "/app/adb"
+        noAdb.moduleReachable = false
+        noAdb.adbUnlocked = false
+        check("语音状态机：没看到模块 → 未连接",
+              noAdb.shortLabel == "未连接")
+    }
+
     // --- 模块端点识别
     //
     // 这版模块把 UAC 拆成两个单向设备报上来，名字里带 AC/AS Interface。
@@ -845,12 +926,12 @@ func runSelfTest() -> Bool {
         // 这句话的口径现在是：声卡是通话**语音**的载体，但光开着不够，还要
         // 装一次语音通路。两条都断言 —— 少任何一条都会退回到拿不成立的因果
         // 去指挥客户点按钮。
-        check("模块声卡这一项说的是实话（不再承诺「开了就有声音」）",
-              (checks.first { $0.title == "模块声卡" }?.detail ?? "").contains("一键安装"))
-        // 指的按钮得跟屏幕上那颗同名：界面早就叫「一键安装」了，报告里还写
-        // 全称的话，客户会去找一个按钮上根本没有的字。
-        check("模块声卡这一项不再用旧按钮全称",
-              !(checks.first { $0.title == "模块声卡" }?.detail ?? "").contains("一键安装通话语音"))
+        check("模块声卡这一项说的是实话（语音会自动补装，不再叫人点按钮）",
+              (checks.first { $0.title == "模块声卡" }?.detail ?? "").contains("补装"))
+        // 界面已经没有「一键安装」按钮了，报告里再写这个旧按钮名，客户会去找
+        // 一个按钮上根本没有的字。
+        check("模块声卡这一项不再提旧按钮「一键安装」",
+              !(checks.first { $0.title == "模块声卡" }?.detail ?? "").contains("一键安装"))
         check("模块声卡这一项不再说「不走 USB 声卡」",
               !(checks.first { $0.title == "模块声卡" }?.detail ?? "").contains("不走 USB"))
         check("出厂组态：联网不可用（不是 ECM）", !Doctor.isReady(.internet, in: checks))
@@ -994,7 +1075,7 @@ func runSelfTest() -> Bool {
         // 命令要是没写进 help，客户复制过去只会得到「未知命令」——
         // sms-storage 刚这样漏过一次，而它正是体检让客户去跑的那一条。
         // 加子命令时这个列表和 usageText 一起改。
-        let dispatched = ["doctor", "usb", "status", "network", "sms-list", "sms-send",
+        let dispatched = ["doctor", "usb", "status", "network", "net-diag", "sms-list", "sms-send",
                           "sms-storage", "call-dial", "voice", "prepare", "voice-enable",
                           "apn", "usbnet", "net-status", "net-enable", "net-disable",
                           "fontcheck", "ussd", "operators", "operator-set", "operator-auto",
@@ -1218,12 +1299,299 @@ func runSelfTest() -> Bool {
     passed += loginResults.passed
     failed += loginResults.failed
 
+    let stateResults = runNetworkStateSuite(check)
+    passed += stateResults.passed
+    failed += stateResults.failed
+
+    // --- 静音标志走 C11 原子，跨线程读写真安全（不是 Swift Bool 数据竞争）---
+    do {
+        let bridge = CallAudioBridge()
+        bridge.setMuted(true)
+        check("静音标志原子写读（开）", bridge.isMuted == true)
+        bridge.setMuted(false)
+        check("静音标志原子写读（关）", bridge.isMuted == false)
+        // 并发烟测：一个线程反复切换，另一个线程反复读。不校验具体值，
+        // 只确认这段无锁原子读写不会让进程崩溃（真正确性以 TSAN 为准）。
+        let stop = DispatchSemaphore(value: 0)
+        var crashed = false
+        let writer = Thread {
+            for _ in 0..<5000 {
+                bridge.setMuted(true)
+                bridge.setMuted(false)
+            }
+            stop.signal()
+        }
+        let reader = Thread {
+            var seen = false
+            for _ in 0..<5000 { seen = seen || bridge.isMuted }
+            if !seen { crashed = true }
+            stop.signal()
+        }
+        writer.start(); reader.start()
+        stop.wait(); stop.wait()
+        check("静音并发读写不崩溃（SIMULATED）", !crashed)
+    }
+
+    // --- 语音 watchdog：区分「对方静音」和「下行真断」，不误触发重连 ---
+    do {
+        func health(upIn: Int, upOut: Int, upPeak: Float,
+                    downIn: Int, downOut: Int, downPeak: Float) -> CallAudioBridge.Health {
+            var h = CallAudioBridge.Health()
+            h.uplinkInputCallbacks = upIn
+            h.uplinkOutputCallbacks = upOut
+            h.uplinkPeak = upPeak
+            h.downlinkInputCallbacks = downIn
+            h.downlinkOutputCallbacks = downOut
+            h.downlinkPeak = downPeak
+            return h
+        }
+        // 对方静音：下行回调在跑、峰值 0.0026（底噪，高于 0.001 死寂天花板）→ 不误报。
+        check("对方正常静音不触发重连（下行底噪 0.0026）",
+              CallAudioWatchdog.verdict(
+                  health: health(upIn: 1, upOut: 1, upPeak: 0.2,
+                                 downIn: 1, downOut: 1, downPeak: 0.0026),
+                  activeSeconds: 10, silentRetryDone: false) == .fine)
+        // 下行真断：回调在跑但峰值 0 → oneWay(下行)。
+        check("下行真断被识别为 oneWay（峰值 0）",
+              CallAudioWatchdog.verdict(
+                  health: health(upIn: 1, upOut: 1, upPeak: 0.2,
+                                 downIn: 1, downOut: 1, downPeak: 0),
+                  activeSeconds: 10, silentRetryDone: false) == .oneWay("下行"))
+        // 四个环节都没回调 → dead。
+        check("音频链路死掉被识别为 dead",
+              CallAudioWatchdog.verdict(
+                  health: health(upIn: 0, upOut: 0, upPeak: 0,
+                                 downIn: 0, downOut: 0, downPeak: 0),
+                  activeSeconds: 5, silentRetryDone: false)
+                  == .dead("麦克风采集、模块放音、模块录音、扬声器播放"))
+        // 两头静音、没重挂过 → silent。
+        check("两头静音被识别为 silent",
+              CallAudioWatchdog.verdict(
+                  health: health(upIn: 1, upOut: 1, upPeak: 0,
+                                 downIn: 1, downOut: 1, downPeak: 0),
+                  activeSeconds: 5, silentRetryDone: false) == .silent)
+        // 已重挂过、仍两头静音 → fine（不重复触发，交由上限管）。
+        check("重挂过仍静音不再重复触发（fine）",
+              CallAudioWatchdog.verdict(
+                  health: health(upIn: 1, upOut: 1, upPeak: 0,
+                                 downIn: 1, downOut: 1, downPeak: 0),
+                  activeSeconds: 5, silentRetryDone: true) == .fine)
+    }
+
+    // --- 第三方残留检测的判定逻辑（launchctl print 未注册也回错误文本）---
+    check("launchctl 未注册（Bad request/Could not find）不误判为已注册",
+          launchdServiceRegistered("Bad request.\nCould not find service \"com.djonehub.native\" in domain for user gui: 501") == false)
+    check("launchctl 已注册（有 state/pid）判为已注册",
+          launchdServiceRegistered("state = running\n  pid = 1234") == true)
+    check("launchctl 空输出判为未注册",
+          launchdServiceRegistered("") == false)
+
+    // --- 残留项统一分类（文件残留 ≠ 运行中 ≠ 已确认争用）---
+    check("只有文件残留 → RESIDUAL_ONLY",
+          classifyEnvConflict(fileExists: true, processRunning: false, directEvidence: false)
+            == .residual)
+    check("程序在运行 → ACTIVE_SUSPECT",
+          classifyEnvConflict(fileExists: true, processRunning: true, directEvidence: false)
+            == .active)
+    check("有直接争用证据 → CONFIRMED_CONFLICT（优先于 ACTIVE）",
+          classifyEnvConflict(fileExists: true, processRunning: true, directEvidence: true)
+            == .confirmed)
+    check("什么都没有 → NOT_DETECTED",
+          classifyEnvConflict(fileExists: false, processRunning: false, directEvidence: false)
+            == .notDetected)
+
+    // --- 流量统计：显示状态 + 纯增量累计（无硬件）---
+    // 场景 1：无模块且无历史流量 → 暂无数据。
+    check("未连接 + 无验证历史 → 暂无数据",
+          TrafficDisplayState.resolve(isConnected: false, countersVerified: false,
+                                      monthVerified: false) == .noData)
+    // 场景 2/3/13/14：Wi-Fi / 旧 en9 / 其他 USB 网卡 / VPN 的读数都进不了
+    // 已验证来源，`countersVerified` 恒假，显示仍是无数据。
+    check("未连接 + 假计数（Wi-Fi/旧en9/其他USB/VPN）→ 暂无数据",
+          TrafficDisplayState.resolve(isConnected: false, countersVerified: false,
+                                      monthVerified: false) == .noData)
+    // 场景 4：有历史缓存但缺少模块身份（monthVerified=false）→ 不显示为真实流量。
+    check("有历史缓存但缺模块身份 → 暂无数据",
+          TrafficDisplayState.resolve(isConnected: false, countersVerified: false,
+                                      monthVerified: false) == .noData)
+    // 场景 6：模块已连接但接口匹配失败 → 暂无法统计。
+    check("已连接 + 无验证读数 → 暂无法统计",
+          TrafficDisplayState.resolve(isConnected: true, countersVerified: false,
+                                      monthVerified: false) == .unavailable)
+    // 场景 5：模块已连接且接口匹配 → 实时本月。
+    check("已连接 + 验证读数 → 实时本月",
+          TrafficDisplayState.resolve(isConnected: true, countersVerified: true,
+                                      monthVerified: false) == .live)
+    // 场景 7：模块断开但有验证历史 → 已记录的4G流量。
+    check("已断开 + 验证历史 → 已记录的4G流量",
+          TrafficDisplayState.resolve(isConnected: false, countersVerified: false,
+                                      monthVerified: true) == .historical)
+
+    // 首次绑定只建基线：生命周期总计数器不能当成本月增量。
+    do {
+        var acc = TrafficAccounting()
+        let d = acc.record(total: 1_211_914_240, interface: "en59",
+                           month: "2026-10", day: "2026-10-25")
+        check("首次绑定只建基线、不计增量", d == 0 && acc.monthTotal == 0 && acc.dayTotal == 0)
+        check("首次绑定记下读数与接口", acc.lastTotal == 1_211_914_240 && acc.lastInterface == "en59")
+    }
+
+    // 场景 15：重复采样不重复累计。
+    do {
+        var acc = TrafficAccounting()
+        _ = acc.record(total: 100, interface: "en59", month: "2026-10", day: "2026-10-25")
+        let d = acc.record(total: 100, interface: "en59", month: "2026-10", day: "2026-10-25")
+        check("重复采样不重复累计", d == 0 && acc.monthTotal == 0)
+    }
+
+    // 正常增量。
+    do {
+        var acc = TrafficAccounting()
+        _ = acc.record(total: 1_000, interface: "en59", month: "2026-10", day: "2026-10-25")
+        let d = acc.record(total: 2_500, interface: "en59", month: "2026-10", day: "2026-10-25")
+        check("正常增量 = 当前读数 − 上次读数",
+              d == 1_500 && acc.monthTotal == 1_500 && acc.dayTotal == 1_500)
+    }
+
+    // 场景 8：模块重新枚举，接口名变了 → 重建基线，不把新接口生命周期当增量。
+    do {
+        var acc = TrafficAccounting()
+        _ = acc.record(total: 5_000, interface: "en59", month: "2026-10", day: "2026-10-25")
+        let d = acc.record(total: 9_000_000_000, interface: "en60", month: "2026-10", day: "2026-10-25")
+        check("接口改变重建基线、不累计生命周期计数", d == 0 && acc.monthTotal == 0 && acc.lastInterface == "en60")
+    }
+
+    // 场景 10/11：计数器归零 / 回绕（读数变小）→ 重建基线，不产生异常大增量。
+    do {
+        var acc = TrafficAccounting()
+        _ = acc.record(total: 8_000, interface: "en59", month: "2026-10", day: "2026-10-25")
+        let d1 = acc.record(total: 120, interface: "en59", month: "2026-10", day: "2026-10-25")
+        let d2 = acc.record(total: 400, interface: "en59", month: "2026-10", day: "2026-10-25")
+        check("计数器归零 → 不计增量、重建基线", d1 == 0)
+        check("归零后从 0 重新累计", d2 == 280 && acc.monthTotal == 280)
+    }
+
+    // 场景 12：月份切换月累计清零、跨天日累计清零。
+    do {
+        var acc = TrafficAccounting()
+        _ = acc.record(total: 1_000, interface: "en59", month: "2026-10", day: "2026-10-31")
+        _ = acc.record(total: 1_500, interface: "en59", month: "2026-10", day: "2026-10-31")
+        let d = acc.record(total: 1_800, interface: "en59", month: "2026-11", day: "2026-11-01")
+        check("跨月月累计从 0 重来", acc.monthTotal == 300 && acc.monthKey == "2026-11")
+        check("跨月那一拍只算新月增量", d == 300)
+    }
+    do {
+        var acc = TrafficAccounting()
+        _ = acc.record(total: 1_000, interface: "en59", month: "2026-10", day: "2026-10-30")
+        _ = acc.record(total: 2_000, interface: "en59", month: "2026-10", day: "2026-10-30")
+        _ = acc.record(total: 2_500, interface: "en59", month: "2026-10", day: "2026-10-31")
+        check("跨天日累计从 0 重来", acc.dayTotal == 500 && acc.monthTotal == 1_500)
+    }
+
+    // 场景 9：App 重启后从持久化现场恢复，接着累计。
+    do {
+        var before = TrafficAccounting()
+        _ = before.record(total: 10_000, interface: "en59", month: "2026-10", day: "2026-10-25")
+        _ = before.record(total: 12_000, interface: "en59", month: "2026-10", day: "2026-10-25")
+        var after = TrafficAccounting(monthKey: before.monthKey, monthTotal: before.monthTotal,
+                                      dayKey: before.dayKey, dayTotal: before.dayTotal,
+                                      lastTotal: before.lastTotal, lastInterface: before.lastInterface)
+        let d = after.record(total: 12_000, interface: "en59", month: "2026-10", day: "2026-10-25")
+        check("重启后恢复现场、同读数不重复累计", d == 0 && after.monthTotal == before.monthTotal)
+        let d2 = after.record(total: 13_000, interface: "en59", month: "2026-10", day: "2026-10-25")
+        check("重启后继续累计增量", d2 == 1_000 && after.monthTotal == before.monthTotal + 1_000)
+    }
+
     banner("通过 \(passed) 项，失败 \(failed) 项")
     // Machine-readable tail: install.sh reports the count to the customer, and
     // a number written into a shell script by hand goes stale — the "118 项"
     // it used to print had been wrong since the suite grew past it.
     print("SELFTEST ok=\(passed) fail=\(failed)")
     return failed == 0
+}
+
+/// 网络链路状态机的纯函数测试：把「注册成功」和「数据连接成功」分开，
+/// NAT 场景下两个 IP 不一致不构成故障。
+func runNetworkStateSuite(_ check: (String, @autoclosure () -> Bool) -> Void) -> (passed: Int, failed: Int) {
+    var passed = 0
+    var failed = 0
+    func verify(_ name: String, _ condition: @autoclosure () -> Bool) {
+        let value = condition()
+        if value { passed += 1 } else { failed += 1 }
+        check(name, value)
+    }
+
+    banner("网络链路状态机（模拟）")
+
+    func make(pdp: Bool = false, interface: String = "", ipv4: String = "") -> DataStatus {
+        var st = DataStatus()
+        st.pdpActive = pdp
+        st.interfaceName = interface
+        st.ipv4Address = ipv4
+        return st
+    }
+
+    let ready = make(pdp: true, interface: "en9", ipv4: "192.168.225.2")
+
+    verify("未插 USB → disconnected",
+           ready.linkState(usbPresent: false, atReady: false, simReady: false,
+                           registered: false, internetVerified: false) == .disconnected)
+    verify("USB 在、AT 未就绪 → usbDetected",
+           ready.linkState(usbPresent: true, atReady: false, simReady: false,
+                           registered: false, internetVerified: false) == .usbDetected)
+    verify("AT 就绪、SIM 未就绪 → atReady",
+           ready.linkState(usbPresent: true, atReady: true, simReady: false,
+                           registered: false, internetVerified: false) == .atReady)
+    verify("SIM 就绪、未注册 → simReady",
+           ready.linkState(usbPresent: true, atReady: true, simReady: true,
+                           registered: false, internetVerified: false) == .simReady)
+    verify("已注册、PDP 未激活 → networkRegistered（注册 ≠ 数据）",
+           make().linkState(usbPresent: true, atReady: true, simReady: true,
+                            registered: true, internetVerified: false) == .networkRegistered)
+    verify("PDP 激活、无网卡 → dataSessionReady",
+           make(pdp: true).linkState(usbPresent: true, atReady: true, simReady: true,
+                                     registered: true, internetVerified: false) == .dataSessionReady)
+    verify("网卡在、无 IP → ecmReady",
+           make(pdp: true, interface: "en9").linkState(usbPresent: true, atReady: true,
+                                                       simReady: true, registered: true,
+                                                       internetVerified: false) == .ecmReady)
+    verify("有 IP、实测未通 → ipReady",
+           ready.linkState(usbPresent: true, atReady: true, simReady: true,
+                           registered: true, internetVerified: false) == .ipReady)
+    verify("有 IP、实测通 → internetVerified（NAT 下两个 IP 不同也成立）",
+           ready.linkState(usbPresent: true, atReady: true, simReady: true,
+                           registered: true, internetVerified: true) == .internetVerified)
+
+    // 「模块侧全好、唯独 macOS 没枚举出网卡 → 该重启模块重新枚举」这个自愈判据。
+    func reset(isConnected: Bool, simReady: Bool, dataRegistered: Bool,
+               usbnetMode: USBnetMode?, compositionNetwork: Bool?, hasInterface: Bool) -> Bool {
+        ModemController.shouldResetForMissingInterface(isConnected: isConnected,
+            simReady: simReady, dataRegistered: dataRegistered, usbnetMode: usbnetMode,
+            compositionNetwork: compositionNetwork, hasInterface: hasInterface)
+    }
+    verify("自愈判据：全好但无网卡 → 该重启",
+           reset(isConnected: true, simReady: true, dataRegistered: true,
+                 usbnetMode: .ecm, compositionNetwork: true, hasInterface: false))
+    verify("自愈判据：没连上不动模块",
+           !reset(isConnected: false, simReady: true, dataRegistered: true,
+                  usbnetMode: .ecm, compositionNetwork: true, hasInterface: false))
+    verify("自愈判据：SIM 没就绪不动模块",
+           !reset(isConnected: true, simReady: false, dataRegistered: true,
+                  usbnetMode: .ecm, compositionNetwork: true, hasInterface: false))
+    verify("自愈判据：未注册不动模块",
+           !reset(isConnected: true, simReady: true, dataRegistered: false,
+                  usbnetMode: .ecm, compositionNetwork: true, hasInterface: false))
+    verify("自愈判据：不是 ECM 不动模块（RNDIS 重启也白搭）",
+           !reset(isConnected: true, simReady: true, dataRegistered: true,
+                  usbnetMode: .rndis, compositionNetwork: true, hasInterface: false))
+    verify("自愈判据：组态不带网络位不动模块",
+           !reset(isConnected: true, simReady: true, dataRegistered: true,
+                  usbnetMode: .ecm, compositionNetwork: false, hasInterface: false))
+    verify("自愈判据：网卡已经在就不用重启",
+           !reset(isConnected: true, simReady: true, dataRegistered: true,
+                  usbnetMode: .ecm, compositionNetwork: true, hasInterface: true))
+
+    return (passed, failed)
 }
 
 /// Start-at-login is the one feature whose failure is invisible: a Mac that
@@ -1330,6 +1698,10 @@ func runSimulatorSuite(_ check: (String, @autoclosure () -> Bool) -> Void) -> (p
     verify("APN 拒绝换行", (try? controller.data.configureAPN("bad\napn")) == nil)
     verify("APN 拒绝空串", (try? controller.data.configureAPN("  ")) == nil)
     verify("APN 用户名拒绝引号", (try? controller.data.configureAPN("CTNET", username: "u\"x")) == nil)
+    // NAT 场景：模块蜂窝侧 IP（CGPADDR 100.69.150.192）与主机 ECM DHCP 拿到的
+    // 地址（QIACT? 里的 10.31.1.42）不同 —— 两者不一致不是故障，各自独立判断。
+    verify("蜂窝侧 IP 独立读出（NAT 与主机地址不同不报错）",
+           (try? controller.data.readPDPAddress()) == "100.69.150.192")
 
     // 截图夹具钉住的字节数，轮询不许把它冲掉。这台机器上只要插着模块，
     // 真网卡的流量就会飘进截图：环形从「剩 43%」变成「剩 100%」，底部那行
@@ -2048,6 +2420,341 @@ func apnReport(_ controller: ModemController) -> String {
         + "  或现在就指定一家：dji4gctl apn 移动 / 联通 / 电信 / 广电 / cmhk / 3hk"
 }
 
+/// 跑一个外部命令，把 stdout 原样带回来；失败返回空串。
+func shellOutput(_ path: String, _ args: [String]) -> String {
+    guard FileManager.default.isExecutableFile(atPath: path) else { return "" }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: path)
+    process.arguments = args
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    process.standardInput = FileHandle.nullDevice
+    do {
+        try process.run()
+    } catch {
+        return ""
+    }
+    let watchdog = DispatchWorkItem { [weak process] in
+        guard let process, process.isRunning else { return }
+        process.terminate()
+    }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 4, execute: watchdog)
+    defer { watchdog.cancel() }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// `launchctl print` 对未注册的服务也回「Bad request / Could not find」，
+/// 不能只看输出非空就判已注册。抽成纯函数好让自检钉住这个坑。
+func launchdServiceRegistered(_ output: String) -> Bool {
+    !output.isEmpty
+        && !output.contains("Could not find")
+        && !output.contains("Bad request")
+}
+
+/// 残留项的统一分类：有直接争用证据 → CONFIRMED；有进程在跑 → ACTIVE_SUSPECT；
+/// 只有文件 → RESIDUAL_ONLY；都没有 → NOT_DETECTED。抽成纯函数好让自检注入
+/// 「文件在/进程在/证据在」三组输入分别断言。
+enum EnvConflictClass: String {
+    case confirmed = "CONFIRMED_CONFLICT"
+    case active = "ACTIVE_SUSPECT"
+    case residual = "RESIDUAL_ONLY"
+    case notDetected = "NOT_DETECTED"
+}
+
+func classifyEnvConflict(fileExists: Bool,
+                         processRunning: Bool,
+                         directEvidence: Bool) -> EnvConflictClass {
+    if directEvidence { return .confirmed }
+    if processRunning { return .active }
+    if fileExists { return .residual }
+    return .notDetected
+}
+
+/// 历史软件与环境冲突检查（只读）。针对 DJOneHubNative / DJOneHub-mac-enhanced
+/// 两个旧项目卸载后可能残留的 LaunchAgent/Daemon、Unix socket 后端、端口、
+/// 可执行文件与重复网络服务。结果分五档：CONFIRMED_CONFLICT / ACTIVE_SUSPECT /
+/// RESIDUAL_ONLY / NOT_DETECTED / UNAVAILABLE。
+func printEnvConflictCheck() {
+    print("")
+    banner("历史软件与环境冲突检查")
+    let home = NSHomeDirectory()
+    let agentsDir = home + "/Library/LaunchAgents"
+    let daemonsDir = "/Library/LaunchDaemons"
+    let knownLabels = [
+        "com.jamie.djonehub",
+        "com.jamie.djonehub-notifier",
+        "com.jamie.djonehub-wifi-sms-guard",
+        "com.djonehub.native",
+        "com.djonehub.routing",
+    ]
+
+    // 1. LaunchAgent / LaunchDaemon 配置文件残留 + 加载状态。
+    var foundPlist: [String] = []
+    for (dir, kind) in [(agentsDir, "LaunchAgent"), (daemonsDir, "LaunchDaemon")] {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
+        for name in names {
+            for label in knownLabels where name == label + ".plist" {
+                foundPlist.append("\(kind):\(dir)/\(name)")
+            }
+        }
+    }
+    field("LaunchAgent/Daemon", foundPlist.isEmpty ? "NOT_DETECTED" : "发现 \(foundPlist.count) 个")
+    for p in foundPlist { print("    · \(p)") }
+
+    let launchctlOut = shellOutput("/bin/launchctl", ["list"])
+    let loaded = knownLabels.filter { launchctlOut.contains($0) }
+    field("launchctl 加载", loaded.isEmpty ? "NOT_DETECTED" : "ACTIVE_SUSPECT: \(loaded.joined(separator: "、"))")
+
+    // 2. 端口 7575（enhanced 后端）。
+    let port = shellOutput("/usr/sbin/lsof", ["-nP", "-iTCP:7575", "-sTCP:LISTEN"])
+    field("端口 7575", port.isEmpty ? "NOT_DETECTED" : "ACTIVE_SUSPECT（旧后端在监听）")
+    if !port.isEmpty { print("    \(port.prefix(120))") }
+
+    // 3. DJOneHubNative 的独立 Unix socket 后端（不是 7575，是 unix socket）。
+    let nativeSupport = home + "/Library/Application Support/DJOneHubNative"
+    let sockPaths = [nativeSupport + "/djonehub.sock",
+                     "/tmp/djonehub.sock",
+                     "/Library/PrivilegedHelperTools/com.djonehub.routing/control.sock"]
+    var sockActive = false
+    var sockResidual = false
+    for sock in sockPaths {
+        if FileManager.default.fileExists(atPath: sock) {
+            sockResidual = true
+            print("    · \(sock)")
+        }
+    }
+    let sockUsers = shellOutput("/usr/sbin/lsof", ["-nP"]).contains("djonehub.sock")
+    if sockUsers { sockActive = true }
+    field("Unix Socket", sockActive ? "ACTIVE_SUSPECT（有进程持有）"
+          : (sockResidual ? "RESIDUAL_ONLY（仅文件残留）" : "NOT_DETECTED"))
+
+    // 4. SMAppService 可观测状态（仅 `com.djonehub.native` 有主 App 自启）。
+    let smStatus = shellOutput("/bin/launchctl", ["print", "gui/\(getuid())/com.djonehub.native"])
+    let smRegistered = launchdServiceRegistered(smStatus)
+    field("SMAppService", smRegistered ? "ACTIVE_SUSPECT（已注册）" : "NOT_DETECTED（未注册）")
+
+    // 4b. com.djonehub.routing 特权 LaunchDaemon（system 域，sing-box 网络核心）。
+    let routingStatus = shellOutput("/bin/launchctl", ["print", "system/com.djonehub.routing"])
+    let routingRegistered = launchdServiceRegistered(routingStatus)
+    field("routing 守护", routingRegistered ? "ACTIVE_SUSPECT（已加载）" : "NOT_DETECTED（未加载）")
+
+    // 5. 旧可执行文件 / 目录（多版本安装位置）。
+    var remnants: [String] = []
+    for p in ["/usr/local/bin/djonehub",
+              "/usr/local/bin/djonehubd",
+              "/usr/local/libexec/djonehub",
+              "/usr/local/libexec/djonehubd",
+              "/opt/homebrew/bin/djonehub",
+              "/Library/PrivilegedHelperTools/com.djonehub.routing",
+              home + "/Library/Application Support/DJOneHub",
+              home + "/Library/Logs/DJOneHub",
+              nativeSupport] {
+        if FileManager.default.fileExists(atPath: p) { remnants.append(p) }
+    }
+    field("旧程序文件", remnants.isEmpty ? "NOT_DETECTED" : "RESIDUAL_ONLY（\(remnants.count) 处，无运行证据）")
+    for p in remnants { print("    · \(p)") }
+
+    // 6. 重复的 Baiwang / DJOneHub 网络服务。
+    let order = shellOutput("/usr/sbin/networksetup", ["-listnetworkserviceorder"])
+    let serviceNames = order.split(separator: "\n")
+        .filter { $0.contains("(") && !$0.contains("Hardware Port") && !$0.contains("Device:") }
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+    let suspect = serviceNames.filter { line in
+        let lower = line.lowercased()
+        return lower.contains("baiwang") || lower.contains("djonehub") || lower.contains("qdc")
+    }
+    let baiwangCount = suspect.filter { $0.lowercased().contains("baiwang") }.count
+    let oldServiceCount = suspect.count - baiwangCount
+    if oldServiceCount == 0 && baiwangCount <= 1 {
+        field("网络服务", baiwangCount == 1 ? "NOT_DETECTED（1 个 Baiwang 属 DJI4G）" : "NOT_DETECTED")
+    } else {
+        field("网络服务", "ACTIVE_SUSPECT / CONFIRMED：Baiwang×\(baiwangCount)，旧服务×\(oldServiceCount)")
+    }
+    for s in suspect { print("    · \(s)") }
+    if oldServiceCount > 0 || baiwangCount > 1 {
+        print("    注意：多个同类型服务可能造成默认路由/网络服务启停冲突")
+    }
+    print("")
+    print("  判定口径：CONFIRMED=有直接争用证据；ACTIVE_SUSPECT=程序在运行；")
+    print("  RESIDUAL_ONLY=只有文件；NOT_DETECTED=未发现；UNAVAILABLE=权限不足。")
+    print("  以上检查均为只读，不会删除文件、结束进程或修改网络配置。")
+}
+
+/// 网络数据连接专项诊断。只发只读命令，逐条保存原始返回值；
+/// 固件不认识的命令标 UNSUPPORTED，绝不猜测结果。
+func runNetDiag(_ controller: ModemController) -> Int32 {
+    banner("网络数据连接 · 专项诊断")
+
+    _ = try? controller.refreshSIM()
+    _ = try? controller.refreshNetwork()
+    _ = try? controller.refreshSignal()
+    _ = controller.refreshData()
+    _ = try? controller.data.readAPN()
+    let moduleIP = (try? controller.data.readPDPAddress()) ?? ""
+
+    field("模块", "\(controller.identity.displayName) / \(controller.identity.revision)")
+    field("IMEI", controller.identity.imei)
+    if let mode = controller.data.status.usbnetMode {
+        field("USB 网络", mode.technicalName)
+    }
+    if let composition = controller.data.status.composition {
+        field("USB 组态", composition.flagString)
+    }
+    field("SIM", controller.sim.ready ? "就绪" : controller.sim.label)
+    field("运营商注册", controller.network.dataRegistered ? "已注册" : "未注册")
+    if !controller.network.carrier.name.isEmpty {
+        field("运营商", controller.network.carrier.name)
+    }
+    print("")
+
+    // 逐条只读 AT 查询，保留原始返回；不支持的标 UNSUPPORTED。
+    // 只发 `?` 读形式：`AT+QNETDEVSTATUS=?` 这类 test 形式、以及不带 `?` 的
+    // 执行形式，对这条 DJI 定制固件有没有副作用没验证过，一律不发。
+    let queries: [(label: String, command: String)] = [
+        ("CPIN?", "AT+CPIN?"),
+        ("CREG?", "AT+CREG?"),
+        ("CGREG?", "AT+CGREG?"),
+        ("CEREG?", "AT+CEREG?"),
+        ("COPS?", "AT+COPS?"),
+        ("CGDCONT?", "AT+CGDCONT?"),
+        ("CGACT?", "AT+CGACT?"),
+        ("CGPADDR", "AT+CGPADDR"),
+        ("QICSGP", "AT+QICSGP=1"),
+        ("QIACT?", "AT+QIACT?"),
+        ("usbnet", "AT+QCFG=\"usbnet\""),
+        ("QNETDEVCTL?", "AT+QNETDEVCTL?"),
+        ("QNETDEVSTATUS?", "AT+QNETDEVSTATUS?"),
+    ]
+    for query in queries {
+        let response: ATResponse?
+        do {
+            response = try controller.session.send(query.command, timeout: 6)
+        } catch {
+            response = nil
+        }
+        guard let response else {
+            field(query.label, "无响应（AT 通道忙或模块不在）")
+            continue
+        }
+        let body = response.rawText.replacingOccurrences(of: "\n", with: "  ")
+        switch response.final {
+        case .ok:
+            field(query.label, body.isEmpty ? "OK" : body)
+        case .error:
+            // ERROR 只代表「这条固件没接这条查询」—— 可能是语法不对，也可能
+            // 是真不支持；没有 QDC507GLEFM21 的官方命令表，不能下「不支持」的
+            // 结论，如实标 ERROR 即可。
+            field(query.label, "ERROR（该固件未识别此查询，支持性待确认）")
+        case .cme(let code):
+            field(query.label, "模块拒绝（+CME ERROR: \(code)）")
+        case .timeout:
+            field(query.label, "TIMEOUT（超时未响应）")
+        case .closed:
+            field(query.label, "通道已关闭")
+        default:
+            field(query.label, "\(response.final.text)\(body.isEmpty ? "" : "  " + body)")
+        }
+    }
+    print("")
+
+    // 主机侧：ECM / DHCP / 网络服务 / 默认路由。
+    let data = controller.data.status
+    field("ECM 接口", data.interfaceName.isEmpty ? "未找到" : data.interfaceName)
+    field("IPv4", data.ipv4Address.isEmpty ? "无" : data.ipv4Address)
+    field("PDP 状态", data.pdpActive ? "已激活" : "未激活（或读不到）")
+    field("模块分配 IP", moduleIP.isEmpty ? "无（0.0.0.0 或读不到）" : moduleIP)
+    field("网络服务", data.serviceLabel)
+    // 模块蜂窝侧 IP 与主机 ECM 网卡 IP 可能不同：部分 ECM 实现做 NAT，
+    // 主机拿到的是独立局域网地址。两个 IP 不一致**不是故障**，不要据此下结论。
+    if !moduleIP.isEmpty, !data.ipv4Address.isEmpty, moduleIP != data.ipv4Address {
+        print("  注：模块 IP 与网卡 IP 不同，属 NAT 场景，非故障。")
+    }
+
+    var gateway = "无"
+    if !data.interfaceName.isEmpty {
+        let route = shellOutput("/sbin/route", ["-n", "get", "default"])
+        for line in route.split(separator: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("gateway:") {
+                gateway = String(trimmed.dropFirst("gateway:".count)).trimmingCharacters(in: .whitespaces)
+            }
+        }
+    }
+    field("网关", gateway)
+
+    let dns = data.serviceName.isEmpty
+        ? "无（未绑定网络服务）"
+        : (shellOutput("/usr/sbin/networksetup", ["-getdnsservers", data.serviceName]).isEmpty
+           ? "读不到" : shellOutput("/usr/sbin/networksetup", ["-getdnsservers", data.serviceName]))
+    field("DNS", dns)
+
+    let routeInterface = NetProbe.defaultRouteInterface()
+    field("默认路由", routeInterface.isEmpty ? "无" : routeInterface)
+    // 4G 这条接口单独验：绑到模块网卡的 IP 上发，不拿 Wi-Fi 的默认路由充数。
+    let probe = NetProbe.reachableInternet(boundToInterface: data.interfaceName)
+    let defaultRouteProbe = NetProbe.reachableInternet()
+    field("互联网连通", probe ? "可访问（经 4G 接口）" : "不可访问（4G 接口不通）")
+    field("默认路由出网", defaultRouteProbe ? "可访问" : "不可访问")
+    let linkState = data.linkState(usbPresent: true,
+                                   atReady: controller.session.isOpen,
+                                   simReady: controller.sim.ready,
+                                   registered: controller.network.dataRegistered,
+                                   internetVerified: probe)
+    field("链路状态", "\(linkState.rawValue)（\(linkState.label)）")
+    print("")
+
+    // 历史软件与环境冲突检查（只读）：旧 DJOneHub 卸载残留、后台服务、端口、
+    // 可执行文件、重复网络服务。
+    printEnvConflictCheck()
+
+    // 错误原因 + 修复建议：只给有依据的结论，不给猜测。
+    var reasons: [String] = []
+    var fixes: [String] = []
+    if !controller.sim.ready {
+        reasons.append("SIM 未就绪")
+        fixes.append("插好标准 nano-SIM 卡")
+    }
+    if controller.sim.ready && !controller.network.dataRegistered {
+        reasons.append("模块没注册上蜂窝网络")
+        fixes.append("dji4gctl network 看注册；信号太弱就换个位置")
+    }
+    if data.interfaceName.isEmpty {
+        reasons.append("macOS 没有为模块建立网卡（可能没切 ECM 或驱动没加载）")
+        fixes.append("dji4gctl usbnet 1 切到 ECM 并重新插拔")
+    }
+    if !data.interfaceName.isEmpty && data.ipv4Address.isEmpty {
+        reasons.append("网卡在但没有 IPv4：PDP 数据会话没起来，或 DHCP 没给地址")
+        fixes.append("跑 dji4gctl net-diag 看上面 QIACT/CGPADDR/QNETDEVSTATUS 的原始返回")
+        fixes.append("确认 APN 正确后重开 4G；若 QNETDEVCTL? 有值则需先建立数据绑定")
+    }
+    if !data.ipv4Address.isEmpty && data.serviceName.isEmpty {
+        reasons.append("有 IP 但 macOS 没建网络服务")
+        fixes.append("稍等或重新插拔，让系统建服务")
+    }
+    if !data.ipv4Address.isEmpty && !data.serviceName.isEmpty && !data.serviceEnabled {
+        reasons.append("网络服务未启用，流量仍走 Wi-Fi")
+        fixes.append("dji4gctl net-enable")
+    }
+    if data.serviceEnabled && !probe {
+        reasons.append("网络服务已启用但实测出不了网")
+        fixes.append("把本命令完整输出发回，重点看 PDP/APN/网关")
+    }
+
+    if reasons.isEmpty {
+        print("  ✓ 链路各环节都正常，可以出网。")
+    } else {
+        print("  错误原因：")
+        for reason in reasons { print("    · \(reason)") }
+        print("")
+        print("  建议：")
+        for fix in fixes { print("    → \(fix)") }
+    }
+    return reasons.isEmpty ? 0 : 1
+}
+
 func runOneShot(_ command: String, controller: ModemController) -> Int32 {
     // Two commands have to work before the module can be claimed: `usb` reads
     // IORegistry only, and `doctor` exists to explain why the claim failed.
@@ -2090,6 +2797,15 @@ func runOneShot(_ command: String, controller: ModemController) -> Int32 {
     do {
         try controller.connect()
     } catch {
+        if command == "net-diag" {
+            // 网络诊断里有一半是 Mac 侧检查（旧软件残留、网络服务、路由），
+            // 不依赖模块，没插模块也要能跑。模块相关那部分明确标注「未连接」。
+            banner("网络数据连接 · 专项诊断")
+            print("  未连接真实 QDC507 模块（\(error)）")
+            print("  无法执行蜂窝数据验证；真实网络状态未验证。")
+            printEnvConflictCheck()
+            return 1
+        }
         print("连接模块失败：\(error)")
         print("看一下用法：dji4gctl help")
         return 1
@@ -2261,6 +2977,31 @@ func runOneShot(_ command: String, controller: ModemController) -> Int32 {
         printData(controller)
         for note in controller.data.diagnostics() { print("  · \(note)") }
 
+    case "net-diag":
+        return runNetDiag(controller)
+
+    case "adb-enable":
+        // 只开 ADB，不装语音运行时。第十四轮受控启用的最小入口。
+        banner("开启 ADB")
+        let provision = ModuleVoiceSetup(session: controller.session)
+        do {
+            let final = try provision.enableADB { progress in
+                switch progress {
+                case .step(let name): print("  … \(name)")
+                case .done(let name): print("  ✓ \(name)")
+                }
+            }
+            print("")
+            field("adb", final.adbBinary ?? "找不到")
+            field("模块可达", final.moduleReachable ? "是" : "否")
+            field("adb 已解锁", final.adbUnlocked ? "是" : "否")
+            print(final.moduleReachable ? "  ✓ ADB 已就绪（未安装语音运行时）" : "  ! ADB 仍不可达")
+            return final.moduleReachable ? 0 : 1
+        } catch {
+            print("  ! \(error)")
+            return 1
+        }
+
     case "voice-provision":
         // 通话语音的一键安装：解锁 ADB → 加载厂商驱动 → 下发语音校准 →
         // 起 PCM 桥 → 打开 audio_enable。做完跑 audio-bridge 就能验。
@@ -2429,6 +3170,15 @@ func runOneShot(_ command: String, controller: ModemController) -> Int32 {
         _ = controller.refreshData()
         let data = controller.data.status
         guard data.hasInterface else {
+            // 「模块侧全好、唯独没网卡」时，net-enable 先自愈一次：AT+CFUN=1,1
+            // 全功能重启触发 USB 重枚举。客户物理拔插救不回来的场景，这一步通常
+            // 能救回来。net-status / net-disable 保持只读 / 只停，不碰模块重启。
+            if command == "net-enable", controller.resurrectNetworkInterfaceIfStuck() {
+                field("接口", "未找到（模块侧已就绪）")
+                print("  已自动重启模块触发重新枚举，USB 会断开约 20 秒。")
+                print("  回来后执行：dji4gctl net-status")
+                return 0
+            }
             field("接口", "未找到")
             print("  模块没有网卡。先确认已切到 ECM（dji4gctl usbnet 1）并重新插拔。")
             return 1
@@ -2502,7 +3252,16 @@ func runOneShot(_ command: String, controller: ModemController) -> Int32 {
         if netDone, audioDone {
             print("")
             print("  两项都已开启，模块不需要改动。")
-            print("  接着确认 macOS 侧：dji4gctl net-status")
+            // 配置都对，但 macOS 可能还没给模块枚举出网卡（改完 usbcfg 后没做
+            // 一次干净重启就会这样）。这种「卡在半路」的状态自动重启模块触发
+            // 一次 USB 重枚举，比让客户反复拔插可靠。
+            _ = controller.refreshData()
+            if controller.resurrectNetworkInterfaceIfStuck() {
+                print("  但 macOS 还没给模块建网卡 —— 已自动重启模块触发重新枚举。")
+                print("  USB 会断开约 20 秒，回来后执行：dji4gctl net-status")
+            } else {
+                print("  接着确认 macOS 侧：dji4gctl net-status")
+            }
             break
         }
 
@@ -2646,6 +3405,7 @@ let usageText = """
                              默认的 ME 只有 23 条，换到 SM 一般有 40 条左右
       call-dial <号码>        拨打电话
       voice                  查看模块声卡与系统默认音频
+      adb-enable             只开 ADB（交口令 + adb 位 0→1 + 重启一次），不装语音
       prepare                一键开启 USB 网卡 + 模块声卡（只重启一次）
       restore                把模块恢复成出厂状态：清掉装进去的文件、把换过的
                              上网模式和打开的声卡都撤回去。卸载 App 之前跑，
@@ -2661,6 +3421,9 @@ let usageText = """
       net-status             查看 macOS 是否为模块启用了网络服务
       net-enable             启用模块网络服务（联网走模块）
       net-disable            停用模块网络服务（默认路由回到 Wi-Fi）
+      net-diag               网络数据连接专项诊断：逐条打印 PDP/ECM/DHCP
+                             原始返回值（不支持的标 UNSUPPORTED），
+                             并给出错误原因与修复建议
       autostart <on|off|status>
                              开机自启（登录时自动运行菜单栏 App）
       at <命令> [秒数]       发送原始 AT 命令（默认等 10 秒，扫网那种给 60）

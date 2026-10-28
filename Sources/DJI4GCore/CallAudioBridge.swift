@@ -1,6 +1,7 @@
 import Foundation
 import CoreAudio
 import AudioToolbox
+import CMacNet
 
 /// 通话音频桥。
 ///
@@ -121,6 +122,10 @@ public final class CallAudioBridge {
     public var isRunning: Bool { running }
 
     private var running = false
+    /// 上行静音。跨线程标志走 `CMacNet` 里的 C11 `_Atomic`（`dj4g_get_muted`），
+    /// 音频实时回调读、主线程写，无锁、无数据竞争。Swift 侧的普通 Bool
+    /// 跨线程读写不是语言层面的线程安全，所以不放这里。
+    public var isMuted: Bool { dj4g_get_muted() != 0 }
     private let lock = NSLock()
     private let uplink = Leg()
     private let downlink = Leg()
@@ -155,6 +160,13 @@ public final class CallAudioBridge {
     }()
 
     public init() {}
+
+    /// 切换上行静音。只静音「麦克风 → 模块」这一段，不关麦克风、不挂断、
+    /// 不打断音频时钟；静音期间持续送入静音 PCM，取消静音立即恢复。
+    public func setMuted(_ muted: Bool) {
+        dj4g_set_muted(muted ? 1 : 0)
+        if muted { lock.lock(); levels.up = 0; lock.unlock() }
+    }
 
     // MARK: - 设备选择
 
@@ -228,7 +240,8 @@ public final class CallAudioBridge {
         self.endpoints = endpoints
 
         do {
-            try uplink.start(source: endpoints.microphone, sink: endpoints.moduleOutput)
+            try uplink.start(source: endpoints.microphone, sink: endpoints.moduleOutput,
+                             isMuted: { dj4g_get_muted() != 0 })
             try downlink.start(source: endpoints.moduleInput, sink: endpoints.speaker)
         } catch {
             uplink.stop()
@@ -251,6 +264,7 @@ public final class CallAudioBridge {
         lock.lock()
         running = false
         levels = Levels()
+        dj4g_set_muted(0)
         lock.unlock()
         onEvent?("通话音频已断开")
     }
@@ -392,6 +406,7 @@ public final class CallAudioBridge {
         private var source: AudioDevice?
         private var sink: AudioDevice?
         private var level: Float = 0
+        private var isMuted: () -> Bool = { false }
         /// 诊断计数：哪一步没数据，一眼能看出来。
         private(set) var inputCallbacks = 0
         private(set) var inputFrames = 0
@@ -449,9 +464,11 @@ public final class CallAudioBridge {
             playScratch?.deallocate()
         }
 
-        func start(source: AudioDevice, sink: AudioDevice) throws {
+        func start(source: AudioDevice, sink: AudioDevice,
+                   isMuted: @escaping () -> Bool = { false }) throws {
             self.source = source
             self.sink = sink
+            self.isMuted = isMuted
             failed = false
             failureText = nil
             ring.reset()
@@ -624,6 +641,16 @@ public final class CallAudioBridge {
                     }
                     let scale = 1.0 / Float(channels)
                     for i in 0..<usable { out[i] *= scale }
+                }
+            }
+
+            // 上行静音：不关麦克风、不打断采集/重采样/环形缓冲的时钟，只是把
+            // 这一段换成静音 PCM。取消静音时立即恢复真实输入，不补积压的旧音频。
+            if isMuted() {
+                mono.withUnsafeMutableBufferPointer { dst in
+                    if let out = dst.baseAddress {
+                        for i in 0..<usable { out[i] = 0 }
+                    }
                 }
             }
 

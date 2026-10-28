@@ -1,5 +1,6 @@
 #include "cmacnet.h"
 
+#include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ifaddrs.h>
@@ -13,6 +14,19 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
+
+/* ── 通话静音的无锁原子标志 ──────────────────────────────────────────────── */
+static _Atomic int dj4g_muted_flag = 0;
+
+void dj4g_set_muted(int muted)
+{
+    atomic_store_explicit(&dj4g_muted_flag, muted ? 1 : 0, memory_order_relaxed);
+}
+
+int dj4g_get_muted(void)
+{
+    return atomic_load_explicit(&dj4g_muted_flag, memory_order_relaxed);
+}
 
 static int match_usb_parent(io_registry_entry_t entry, uint16_t vendorID, uint16_t productID)
 {

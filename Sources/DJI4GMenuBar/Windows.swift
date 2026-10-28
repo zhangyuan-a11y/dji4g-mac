@@ -2,17 +2,6 @@ import SwiftUI
 import AppKit
 import DJI4GCore
 
-/// 「运营商」那一栏先按地区分：自动识别（默认）/ 中国大陆 / 中国香港 /
-/// 自定义。香港与大陆是两套卡、两套 APN，混在一个列表里客户反而点错。
-private enum OperatorRegion: String, CaseIterable, Identifiable {
-    case auto = "自动识别"
-    case mainland = "大陆"
-    case hongKong = "香港"
-    case custom = "自定义"
-
-    var id: String { rawValue }
-}
-
 /// Dial, answer, hang up, and route the call audio to the module.
 struct CallWindow: View {
     @EnvironmentObject private var model: AppModel
@@ -72,16 +61,9 @@ struct CallWindow: View {
                 Spacer()
                 if model.callVoiceLive {
                     Circle().fill(Theme.phosphorInk).frame(width: 6, height: 6)
-                } else if !model.voiceSetup.ready {
-                    // 通话中不给这个按钮：安装的第一步会重启模块，而桥正挂在
-                    // USB 声卡上 —— 点了就是把这一通电话掐成没声音的。
-                    Button(model.voiceRepairing ? "补装中…" : "一键安装") { model.installCallVoice() }
-                        .label(10)
-                        .buttonStyle(.plain)
-                        .foregroundStyle(Theme.ink)
-                        .disabled(!model.isConnected || model.call.state.isBusy
-                                  || model.isWorking || model.voiceRepairing)
-                        .help("把通话要用的语音功能准备好。模块会重启一次。")
+                } else if model.voiceRepairing {
+                    // 自动补装中：只显示进度，不给按钮 —— 语音安装已封装成自动。
+                    ProgressView().controlSize(.small)
                 }
             }
 
@@ -113,8 +95,8 @@ struct CallWindow: View {
                 }
             }
 
-            // 不摆说明书：这一格的结论（已就绪 / 还没装好）和那颗「一键安装」
-            // 就在上面，为什么 / 怎么装全在 `.help` 里。
+            // 不摆说明书：这一格的结论（已就绪 / 还没装好 / 补装中）就在上面，
+            // 语音安装已封装成自动，这里只报状态。
             //
             // 唯一要占一行的是「两件事撞在一起」的那种状态 —— 上面写着「已就绪」
             // （模块里的通路好着），模块声卡却关着（客户为插手机 / 平板关的），
@@ -123,21 +105,14 @@ struct CallWindow: View {
                 Text("模块声卡没开，打电话没声音")
                     .label(9)
                     .foregroundStyle(Theme.alertInk)
-                    .help("在「模块设置」里把「使用模式」切回 Mac 版，模块重启一次就好。")
+                    .help("在「模块设置」里把「使用场景」切回 Mac 版，模块重启一次就好。")
             }
 
-            // 手动路由那一行。绝大多数客户用不到 —— 通话语音走的是上面的桥，
-            // 全程不动系统默认设备。留着它是给「想拿模块当普通 USB 声卡用」的
-            // 人一条路，顺手把声卡状态也报在这里。
+            // 模块声卡状态行，只读。通话语音走上面的桥、不动系统默认设备；
+            // 声卡开关由「使用场景」（Mac 版 / 移动版）自动决定，这里只报状态。
             HStack(spacing: 6) {
                 Text("模块声卡").label(9).foregroundStyle(Theme.inkNote)
                 Text(model.voice.label).label(9).foregroundStyle(Theme.inkNote).lineLimit(1)
-                Spacer()
-                Button(model.voice.isRouted ? "已切换" : "切到模块") { model.routeAudioToModule() }
-                    .label(9)
-                    .buttonStyle(.plain)
-                    .foregroundStyle(Theme.inkNote)
-                    .disabled(model.voice.moduleDevice == nil)
             }
 
             // 号码这一行只管号码。
@@ -147,8 +122,12 @@ struct CallWindow: View {
             // 负责号码，动作全归下面那一排（回车照样能拨）。
             TextField("", text: $number)
                 .textFieldStyle(.roundedBorder)
-                .label(12)
-                .ownPlaceholder("号码", size: 12, shows: number.isEmpty)
+                .label(16)
+                // 输入框是白底（roundedBorder），而 App 在深色模式下默认文字
+                // 是白的 → 白底白字看不清。这里显式钉成软件绿的「墨」那一档
+                // （浅底专用，深绿），跟整支工具的绿色主题一致。
+                .foregroundStyle(Theme.phosphorInk)
+                .ownPlaceholder("号码", size: 16, shows: number.isEmpty)
                 .onSubmit { dial() }
 
             // 这一排只摆此刻真按得动的动作，跟着通话状态换 —— 和菜单栏面板顶上
@@ -185,24 +164,38 @@ struct CallWindow: View {
                     PillButton(title: "挂断", glyph: "phone.down.fill",
                                tint: Theme.alertInk,
                                isEnabled: false) { model.hangup() }
+                case .active:
+                    // 通话中：静音 + 挂断。静音只停上行麦克风，对方听不见、通话不挂断。
+                    PillButton(title: model.callMuted ? "取消静音" : "静音",
+                               glyph: model.callMuted ? "mic.slash.fill" : "mic.fill",
+                               tint: model.callMuted ? Theme.alertInk : Theme.ink,
+                               isEnabled: model.callVoiceLive) { model.toggleCallMute() }
+                    PillButton(title: "挂断", glyph: "phone.down.fill",
+                               tint: Theme.alertInk) { model.hangup() }
                 default:
-                    // 呼出中 / 对方振铃 / 通话中 / 保持中：这一刻只有一件事能做。
+                    // 呼出中 / 对方振铃 / 保持中：这一刻只有挂断一件事能做。
                     PillButton(title: "挂断", glyph: "phone.down.fill",
                                tint: Theme.alertInk) { model.hangup() }
                 }
             }
 
-            // 按键音键盘。只在真正接通后出现 —— 自动语音台（「按 1 转人工」）
-            // 是它唯一的用场，别的时候一格都不占。
+            // 电话键盘。空闲 / 刚结束时是「拨号盘」—— 点一位填进上面的号码框，
+            // 客户不用在 Mac 键盘上找数字；接通后变成「按键音」—— 按一位发一位，
+            // 给自动语音台（「按 1 转人工」）用。一张键盘两用，和手机电话一个样。
             //
             // 2026-09-30 之前这里是系统输入框 + 一行素字按钮（用户原话：
             // 「这个 UI 设计很丑，参考优秀设计，重新设计」）。键盘就是电话
-            // 机上那张：三列四行，按一位发一位。
-            if model.call.state == .active {
+            // 机上那张：三列四行。
+            switch model.call.state {
+            case .idle, .ended:
+                DTMFKeypad { appendDigit($0) }
+            case .active:
                 VStack(alignment: .leading, spacing: 5) {
                     Text("按键音").label(10).foregroundStyle(Theme.ink)
                     DTMFKeypad { model.sendDTMFKey($0) }
                 }
+            default:
+                EmptyView()
             }
 
             historySection
@@ -223,6 +216,12 @@ struct CallWindow: View {
     private func dial() {
         guard !number.isEmpty else { return }
         model.dial(number)
+    }
+
+    /// 拨号盘上点一位，填进号码框。`*` `#` 一起放行 —— 运营商服务码
+    /// （`*100` 这类）离不开它俩，`sanitise` 那套本来也认它们。
+    private func appendDigit(_ digit: String) {
+        number.append(digit)
     }
 
     // MARK: - 通话记录
@@ -347,10 +346,11 @@ struct CallWindow: View {
     }
 }
 
-/// 通话里的按键音键盘 —— 电话机上那一张。
+/// 电话键盘 —— 电话机上那一张（三列四行）。
 ///
-/// 只画不管发：按下去是一次 `sendDTMFKey(_:)`，排队与发送在 `AppModel`
-/// （连点两下不能被「上一步操作还没结束」顶回来）。
+/// 只画不管发：按下去把这一位交给 `action`。空闲时 `action` 把它填进号码框，
+/// 通话中则走 `sendDTMFKey(_:)`（排队与发送在 `AppModel`，连点两下不会被
+/// 「上一步操作还没结束」顶回来）。
 private struct DTMFKeypad: View {
     var action: (String) -> Void
 
@@ -390,10 +390,9 @@ private struct DTMFKeypad: View {
 /// firmware will do calls and ECM data at the same time.
 struct SetupWindow: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.openWindow) private var openWindow
     @State private var quotaText = ""
     @State private var showLog: Bool
-    @State private var operatorRegion: OperatorRegion = .auto
-    @State private var customAPN = ""
     private let debugExpanded: Bool
 
     /// `logExpanded` 只有截图会传：运行日志默认收起，而它的展开态也得留一张
@@ -461,18 +460,13 @@ struct SetupWindow: View {
                 }
             }
 
-            // 这一页只有一件事要客户选：这模块插在哪台设备上用。原来它是
-            // 「手机外放」一行（一颗「改成正常」按钮）加下面那个四档下拉
-            // （Windows 电脑 / 这台 Mac / 特殊用途 MBIM / 特殊用途 QMI）——
-            // 一个概念被拆成两处、四个协议名字，客户读到的都不知道能不能动。
-            //
-            // 2026-09-27 起合并成两档，名字就是客户嘴里的说法：Mac 版 / 移动版。
-            // 插回电脑时程序会自己回到上次选的那一档（`restoreHostModeIfNeeded`），
-            // 所以平时这里不用动。
-            SetupRow(title: "使用模式",
-                     help: "插电脑用选「Mac 版」，插手机、平板用选「移动版」。"
-                         + "换一档要重启模块一次，约一分钟。"
-                         + "插回电脑时，程序会自动回到你上次选的那一档。") {
+            // 使用场景：插电脑打电话选「Mac 版」（声卡开），插手机/平板上网选
+            // 「移动版」（声卡关，否则手机会被模块顶掉声音）。换一档模块重启一次，
+            // 插回电脑时程序会自己回到上次选的那一档。
+            SetupRow(title: "使用场景",
+                     help: "插电脑打电话选「Mac 版」；插手机、平板上网选「移动版」。"
+                         + "换一档模块重启一次，约一分钟。手机/平板上只能上网，"
+                         + "打电话和短信做不了。插回电脑时程序会自己回到你上次选的那一档。") {
                 HStack(spacing: 5) {
                     ForEach(HostMode.allCases, id: \.self) { mode in
                         let active = model.hostModeNow == mode
@@ -481,9 +475,6 @@ struct SetupWindow: View {
                             .buttonStyle(.plain)
                             .disabled(!canChangeModule)
                             .foregroundStyle(active ? Theme.phosphorInk : Theme.ink)
-                            // 和上面 APN 那四颗同一套语汇：正在用的那一档描绿边、
-                            // 铺极浅绿底，另一档白面灰边。模块没连上时读不出是哪
-                            // 一档，两颗都不点亮，整行一起压暗。
                             .padding(.horizontal, 9)
                             .padding(.vertical, 3.5)
                             .background(
@@ -509,59 +500,24 @@ struct SetupWindow: View {
                 SetupRow(title: "通话语音",
                          note: voicePlainLabel,
                          help: "要能听见对方说话，得先把这一步装进模块。"
-                             + "第一次装会重启一次模块，约一分钟。"
-                             + "装好以后每次拔线都会丢一次，插回来程序会自己补，不用管。") {
-                    RowButton(model.voiceRepairing ? "装着呢…" : "一键安装",
-                              isEnabled: canChangeModule) {
-                        model.installCallVoice()
+                             + "程序会在模块插上、空闲时自动装好，不用手动点；"
+                             + "第一次装会重启一次模块，约一分钟。") {
+                    if model.voiceRepairing {
+                        ProgressView().controlSize(.small)
                     }
                 }
             }
 
             Divider()
 
-            // 运营商按地区分组：自动识别（默认）先认卡，认不出再手选地区。
-            // 香港卡和大陆卡是两套 APN，混在一个列表里客户会点错 —— 这正是
-            // CMHK 曾被当成大陆移动、3HK 曾被配成 3GNET 的根子。
+            // 运营商：自动识别 SIM 的归属并配置对应 APN。只显示识别结果，
+            // 不再让客户手选地区/运营商 —— 自动识别已覆盖大陆与香港卡。
             SetupRow(title: "运营商",
-                     note: model.isConnected ? "" : "先连上模块",
-                     help: model.isConnected
-                         ? "默认自动识别。认不出卡是哪一家、或要用套餐专属 APN 时，"
-                           + "先选地区再点对应那一家；虚拟运营商在「自定义」里填 APN。"
-                         : "模块连上以后才能点。卡还没认到也不影响 —— 选地区、"
-                           + "点哪一家就按哪一家配置。") {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 5) {
-                        ForEach(OperatorRegion.allCases) { region in
-                            let active = operatorRegion == region
-                            Button(region.rawValue) { operatorRegion = region }
-                                .label(9)
-                                .buttonStyle(.plain)
-                                .foregroundStyle(active ? Theme.phosphorInk : Theme.ink)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 3.5)
-                                .background(
-                                    Capsule()
-                                        .fill(active ? Theme.phosphorInk.opacity(0.14) : Theme.chromeHi)
-                                        .overlay(
-                                            Capsule().strokeBorder(
-                                                active ? Theme.phosphorInk.opacity(0.75)
-                                                       : Theme.chromeEdgeStrong,
-                                                lineWidth: 1.2))
-                                )
-                        }
-                    }
-
-                    switch operatorRegion {
-                    case .auto:
-                        autoOperatorControl
-                    case .mainland:
-                        operatorButtons(CarrierCatalog.mainlandChina)
-                    case .hongKong:
-                        operatorButtons(CarrierCatalog.hongKong)
-                    case .custom:
-                        customAPNControl
-                    }
+                     note: model.isConnected ? autoDetectCaption : "先连上模块",
+                     help: "自动识别 SIM 卡的运营商并配置对应上网参数。"
+                         + "换卡后会自动重新识别，不用手动选。") {
+                if model.isConnected {
+                    RowButton("重新识别") { model.applyCarrierAPN(force: true, carrier: nil) }
                 }
             }
 
@@ -633,6 +589,17 @@ struct SetupWindow: View {
             // 临时的一截：只读查看页。不需要了就删掉这两行和 `RemoteDebug.swift`，
             // 别处没有牵连。
             RemoteDebugSection(expanded: debugExpanded)
+
+            Divider()
+
+            // 网络诊断入口：只读，复用内置 dji4gctl，不改动任何设置。
+            SetupRow(title: "网络诊断",
+                     note: "连不上网时用",
+                     help: "检查 SIM / 注册 / 数据会话 / ECM / DHCP / 4G 连通性，并可导出诊断报告。") {
+                RowButton("打开") {
+                    openWindow(id: WindowID.netdiag)
+                }
+            }
         }
         .padding(14)
         .frame(width: 380)
@@ -684,36 +651,6 @@ struct SetupWindow: View {
 
     /// 正在用的那家点亮，其余压暗 —— 四个按钮长得一模一样，客户点完要知道
     /// 到底落在哪一家上。
-    private func apnTint(for carrier: Carrier) -> Color {
-        // 不要再叠一层透明度：胶囊自己已经 `.opacity(0.55)` 压过一道，
-        // 这里再来一次就是 0.25，四个运营商名字会淡到只剩影子。
-        guard model.isConnected else { return Theme.inkNote }
-        return apnActive(for: carrier) ? Theme.phosphorInk : Theme.ink
-    }
-
-    /// 这一家是不是当前生效的那家（用于胶囊描边/填充）。没连模块时一律不算
-    /// 「生效」—— 那时候读回来的 APN 还是上一次的缓存，点亮它是在骗人。
-    private func apnActive(for carrier: Carrier) -> Bool {
-        model.isConnected
-            && carrier.matches(apn: model.data.apn)
-    }
-
-    /// 自动识别：一个按钮按下就用「卡归属运营商」配 APN；旁边一行字把当前
-    /// 认到的卡和网络摆出来，让客户知道程序看到了什么。
-    @ViewBuilder
-    private var autoOperatorControl: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 6) {
-                RowButton(model.isConnected ? "自动识别" : "自动识别", isEnabled: model.isConnected) {
-                    model.applyCarrierAPN(force: true, carrier: nil)
-                }
-                Text(autoDetectCaption)
-                    .label(9)
-                    .foregroundStyle(Theme.inkNote)
-            }
-        }
-    }
-
     private var autoDetectCaption: String {
         let home = model.sim.homeCarrier
         if home.apn.isEmpty {
@@ -727,55 +664,6 @@ struct SetupWindow: View {
         return text
     }
 
-    /// 一列运营商按钮，每个写自己的 APN。
-    @ViewBuilder
-    private func operatorButtons(_ carriers: [Carrier]) -> some View {
-        HStack(spacing: 5) {
-            ForEach(carriers, id: \.self) { carrier in
-                let active = apnActive(for: carrier)
-                Button(carrier.shortName) { model.applyCarrierAPN(force: true, carrier: carrier) }
-                    .label(9)
-                    .buttonStyle(.plain)
-                    .disabled(!model.isConnected)
-                    .foregroundStyle(apnTint(for: carrier))
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 3.5)
-                    .background(
-                        Capsule()
-                            .fill(active ? Theme.phosphorInk.opacity(0.14) : Theme.chromeHi)
-                            .overlay(
-                                Capsule().strokeBorder(
-                                    active ? Theme.phosphorInk.opacity(0.75)
-                                           : Theme.chromeEdgeStrong,
-                                    lineWidth: 1.2))
-                    )
-                    .opacity(model.isConnected ? 1 : 0.55)
-                    .help("按 \(carrier.name) 配置上网参数（\(carrier.apn)）")
-            }
-        }
-    }
-
-    /// 自定义 APN：给香港虚拟运营商、或套餐 APN 与默认不同的卡。
-    @ViewBuilder
-    private var customAPNControl: some View {
-        HStack(spacing: 6) {
-            TextField("", text: $customAPN)
-                .textFieldStyle(.plain)
-                .ownPlaceholder("例如 mobile.lte.three.com.hk", size: 12,
-                                shows: customAPN.isEmpty)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 7)
-                        .fill(Theme.chromeHi)
-                        .overlay(RoundedRectangle(cornerRadius: 7)
-                            .strokeBorder(Theme.chromeEdgeStrong, lineWidth: 1))
-                )
-            RowButton("保存", isEnabled: model.isConnected && !customAPN.isEmpty) {
-                model.applyCustomAPN(customAPN)
-            }
-        }
-    }
 }
 
 /// 设置页每一行的骨架：左边功能名，右边控件。

@@ -62,12 +62,48 @@ public enum NetProbe {
         return reachable
     }
 
+    /// 把探测绑到某块网卡上再发 —— 走**那条接口**，而不是系统默认路由。
+    ///
+    /// 「整台电脑能不能出网」和「4G 这条接口能不能出网」是两件事：默认路由
+    /// 还在 Wi-Fi 上的时候，`reachableInternet()` 测的是 Wi-Fi；要单独验
+    /// 4G，得把 socket 绑到模块那块网卡拿到的 IP 上再 connect。网卡没有 IP
+    /// 时直接判不通 —— 没有地址谈什么接口出网。
+    public static func reachableInternet(boundToInterface interface: String,
+                                         timeout: TimeInterval = 3) -> Bool {
+        guard !interface.isEmpty else { return false }
+        var address = [CChar](repeating: 0, count: 64)
+        cmacnet_interface_ipv4(interface, &address, address.count)
+        let localIP = String(cString: address)
+        guard !localIP.isEmpty, !localIP.hasPrefix("169.254.") else { return false }
+
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var reachable = false
+        for target in targets {
+            group.enter()
+            DispatchQueue.global(qos: .utility).async {
+                defer { group.leave() }
+                guard tcpConnect(host: target.host, port: target.port,
+                                 timeout: timeout, bindTo: localIP) else { return }
+                lock.lock()
+                reachable = true
+                lock.unlock()
+            }
+        }
+        _ = group.wait(timeout: .now() + timeout + 0.5)
+        lock.lock()
+        defer { lock.unlock() }
+        return reachable
+    }
+
     /// 一次非阻塞 connect + `select` 等结果。成功 = 三次握手真的完成了，
     /// 也就是这条路真的能把包送出去并收回来。
     ///
     /// 不用 `connect()` 的阻塞模式：默认路由压在死链路上时，它要等内核的
     /// TCP 超时（分钟级），面板会一直卡在那里。
-    public static func tcpConnect(host: String, port: UInt16, timeout: TimeInterval) -> Bool {
+    public static func tcpConnect(host: String, port: UInt16,
+                                  timeout: TimeInterval,
+                                  bindTo localIP: String? = nil) -> Bool {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
@@ -78,6 +114,19 @@ public enum NetProbe {
         guard fd >= 0 else { return false }
         defer { close(fd) }
         _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK)
+
+        // 需要走指定接口时，先把自己绑到那块网卡的本地 IP 上。
+        if let localIP, !localIP.isEmpty {
+            var local = sockaddr_in()
+            local.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            local.sin_family = sa_family_t(AF_INET)
+            guard inet_pton(AF_INET, localIP, &local.sin_addr) == 1 else { return false }
+            guard withUnsafePointer(to: &local, { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }) == 0 else { return false }
+        }
 
         let started = withUnsafePointer(to: &addr) { pointer in
             pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
